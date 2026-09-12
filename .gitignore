@@ -1,0 +1,12 @@
+# 生成物
+output/*.xml
+state/*.json
+logs/*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

@@ -1,0 +1,102 @@
+# local_rss 配置
+#
+# 每个 feeds 条目 = 一个 RSS 输出文件。
+# type 对应 localrss/providers/ 下已注册的 provider（见 `python3 rss.py --list-types`）。
+#
+# 注意：定时刷新的间隔不在这里，在 ecosystem.config.js 的 cron_restart（pm2 调度）。
+
+bridge:
+  # Kimi WebBridge daemon 地址，一般不用改
+  url: http://127.0.0.1:10086/command
+  # 所有标签页归到这个 session 的标签组里
+  session: local-rss
+  group_title: 本地 RSS
+  # 运行结束后关掉本次打开的标签页（只关本 session 的，不动你自己的页面）。
+  # 也可以用 `python3 rss.py --keep-tabs` 临时保留。
+  close_session: true
+
+output:
+  dir: output          # RSS 文件输出目录（相对本文件所在目录）
+  state_dir: state     # 去重/增量用的状态目录
+  history: 300         # 每个源最多保留多少条
+  # 订阅服务的地址前缀（由 pm2 里的 local-rss-http 提供，端口见 ecosystem.config.js）。
+  # 用于 RSS 里的 <atom:link rel="self">。
+  base_url: http://127.0.0.1:8666
+
+# 全局关键词过滤：标题或正文命中任一关键词的条目会被丢掉（大小写不敏感的子串匹配）。
+# 对所有 feeds 生效，去掉/关掉就把整个列表清空。
+exclude_keywords:
+  - 妙界
+  - 温眠
+  - 小蓝瓶鱼油
+  - 护眼仪
+  - 护颈枕
+  - 小冰席
+  - 海力生
+  - 冲牙器
+  - 小闪电
+  - 电动牙刷
+  - 互动抽奖
+  - 神气小鹿
+  - Apple Log课程
+  - 足浴
+  - Rokid
+  - 兰气泡油
+  - 捞捞
+  - 捞一下
+  - 捞一把
+  - 捞一手
+  - 按摩仪
+
+feeds:
+  # ---- B 站动态（关注动态，对应 https://t.bilibili.com/）----
+  - id: bilibili-follow
+    type: bilibili
+    title: bilibili
+    description: t.bilibili.com 关注动态
+    site_url: https://t.bilibili.com/
+    enabled: true
+    options:
+      mode: feed       # feed = 关注动态；space = 指定 UP 主
+      max_pages: 3     # 每页约 20 条，抓满 max_pages 或遇到已有记录就停
+      # 过滤掉「转发自 @自己」的回环转发（转发的原动态就是本人发的）
+      filter_self_repost: true
+      # 过滤掉纯图动态（只有图片、没有正文的那些）
+      filter_image_only: true
+      # 在每条正文开头放 UP 主头像（RSS 没有「每条一个图标」的字段，只能这样带出来）
+      show_avatar: false
+      # 视频动态内嵌 B 站官方播放器（<iframe>），可以直接在阅读器里播。
+      #   mobile      移动版 html5mobileplayer —— 喂渐进式 mp4，iOS 能播；
+      #               但它在 <video> 上写死了 playsinline，iOS 拿不到原生全屏（全屏会黑屏）
+      #   html5player blackboard/html5player —— 走 MSE，不带 playsinline，测试中
+      #   desktop     player.bilibili.com 外链播放器（MSE）
+      #   newplayer   blackboard/player（我测的卡在初始化出不来，留作对照）
+      #   false       关闭，只留标题链接 + 封面图
+      embed_player: mobile
+
+  # ---- 知乎个人动态 ----
+  - id: zhihu-kvxjr369f
+    type: zhihu
+    title: kvxjr369f
+    description: 知乎个人主页动态
+    site_url: https://www.zhihu.com/people/kvxjr369f
+    enabled: true
+    options:
+      token: kvxjr369f
+      max_pages: 5
+      # 正文相同的只保留一条（同一条回答会以「回答了问题」+「收藏了回答」出现两次）
+      dedupe_by_content: true
+      # 抓全文（导航到内容页从 DOM 取正文）。每条只抓一次，存在 state 里。
+      fulltext: true
+      # 每次运行最多补几篇全文（首次启用时历史条目分批补齐，避免单次跑太久）
+      max_fulltext_per_run: 10
+
+  # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
+  # - id: bilibili-up
+  #   type: bilibili
+  #   title: B站 · 某某UP主
+  #   site_url: https://space.bilibili.com/123456/dynamic
+  #   options:
+  #     mode: space
+  #     uid: 123456
+  #     max_pages: 2

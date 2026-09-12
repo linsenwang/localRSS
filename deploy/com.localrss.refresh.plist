@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd 定时刷新（每 30 分钟一次）。
+
+  启用：
+    cp deploy/com.localrss.refresh.plist ~/Library/LaunchAgents/
+    launchctl unload ~/Library/LaunchAgents/com.localrss.refresh.plist 2>/dev/null
+    launchctl load  ~/Library/LaunchAgents/com.localrss.refresh.plist
+    launchctl list | grep localrss          # 确认已加载
+
+  立即跑一次：
+    launchctl start com.localrss.refresh
+
+  停用：
+    launchctl unload ~/Library/LaunchAgents/com.localrss.refresh.plist
+
+  改间隔：改下面的 StartInterval（秒）后重新 load。
+  日志：logs/refresh.log / logs/refresh.err.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.localrss.refresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/yangqian/Downloads/local_rss/run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/yangqian/Downloads/local_rss</string>
+
+    <!-- 30 分钟；改这里即可调整刷新间隔（单位：秒） -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- 加载时（含开机/登录后）先跑一次 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 上一次没跑完就跳过这一次，避免叠加 -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- 休眠期间错过的时间点，唤醒后会补跑一次，不会堆积 -->
+    <key>StandardOutPath</key>
+    <string>/Users/yangqian/Downloads/local_rss/logs/refresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/yangqian/Downloads/local_rss/logs/refresh.err.log</string>
+</dict>
+</plist>
