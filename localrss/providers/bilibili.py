@@ -76,6 +76,7 @@ EXTRACT_JS = r"""
       ts: parseInt(a.pub_ts || '0', 10),
       text: (dyn.desc && dyn.desc.text) || '',
       mt: major.type || '',
+      season: '',  // 合集更新的徽标文字（major.ugc_season 才有）
       archive: null, draw: null, article: null, opus: null, common: null, orig: null
     };
     if (major.archive) {
@@ -84,6 +85,19 @@ EXTRACT_JS = r"""
         bvid: major.archive.bvid || '',
         cover: major.archive.cover || '',
         desc: major.archive.desc || ''
+      };
+    }
+    // 「更新了合集」（MAJOR_TYPE_UGC_SEASON）：结构就是一个刚更新的视频 + 合集徽标，
+    // 所以并进 archive 走同一套渲染（标题取视频标题、正文带播放器），
+    // 只额外记下徽标文字，正文里那行写成「合集更新：」。
+    if (major.ugc_season) {
+      const s = major.ugc_season;
+      o.season = (s.badge && s.badge.text) || '合集';
+      o.archive = {
+        title: s.title || '',
+        bvid: s.bvid || '',
+        cover: s.cover || '',
+        desc: s.desc || ''
       };
     }
     if (major.draw && major.draw.items) {
@@ -225,8 +239,9 @@ def _apply_player(item: Item, style: str) -> None:
     content = _PLAYER_RE.sub("", item.content or "")
     if style:
         for bvid in _bvids_of(item):
+            # 正文里那行说明：普通投稿是「投稿视频：」，合集更新是「合集更新：」
             pat = re.compile(
-                r'(<p>投稿视频：<a href="https://www\.bilibili\.com/video/'
+                r'(<p>(?:投稿视频|合集更新)：<a href="https://www\.bilibili\.com/video/'
                 + re.escape(bvid) + r'">.*?</a></p>)', re.S
             )
             if pat.search(content):
@@ -406,8 +421,10 @@ def _content_html(o: dict) -> str:
         a = o["archive"]
         link = VIDEO_URL + a["bvid"] if a.get("bvid") else ""
         title = _esc(a.get("title", ""))
-        parts.append(f'<p>投稿视频：<a href="{link}">{title}</a></p>' if link
-                     else f"<p>投稿视频：{title}</p>")
+        # 合集更新和普通投稿一样是个视频卡片，只是正文里那行说明不同
+        label = "合集更新" if o.get("season") else "投稿视频"
+        parts.append(f'<p>{label}：<a href="{link}">{title}</a></p>' if link
+                     else f"<p>{label}：{title}</p>")
         if a.get("desc"):
             parts.append(f"<p>{_text_html(a['desc'])}</p>")
         if a.get("cover"):
