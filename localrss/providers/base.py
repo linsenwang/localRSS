@@ -43,6 +43,12 @@ class Provider:
         self.options = dict(options or {})
         # 与具体站点无关的公共配置（目前只有全局关键词过滤）
         self.common = dict(common or {})
+        #: postprocess 自己新造出来的条目数（比如图片合集）。
+        #: fetch 抓到的新增走返回值，这个用来认「没抓到新动态、但 RSS 里多了内容」的情况。
+        self.derived_items = 0
+        #: 被 postprocess 收进合集的条目数（不是被过滤掉，只是不单条出现）。
+        #: cli 用它把「过滤掉 N 条」和「合并进合集」分开报，免得看起来像丢了信息。
+        self.grouped_items = 0
 
     def opt(self, key: str, default=None):
         value = self.options.get(key)

@@ -28,6 +28,7 @@ def build_rss(
     description: str = "",
     items: list[Item] | None = None,
     self_url: str = "",
+    hub_url: str = "",
     language: str = "zh-CN",
 ) -> str:
     out: list[str] = [
@@ -46,6 +47,10 @@ def build_rss(
         out.append(
             f'<atom:link href="{escape(self_url)}" rel="self" type="application/rss+xml"/>'
         )
+    # WebSub：告诉阅读器「这个 feed 的更新由哪个 hub 转发」。阅读器订阅时会把
+    # 自己的回调地址注册到这个 hub，之后我们 ping 一次 hub，它就来抓 feed 并推给订阅者。
+    if hub_url:
+        out.append(f'<atom:link href="{escape(hub_url)}" rel="hub"/>')
 
     for item in items or []:
         out.append("<item>")

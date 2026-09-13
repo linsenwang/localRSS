@@ -1,16 +1,18 @@
 // pm2 配置 —— local_rss
 //
-// 两个进程：
+// 三个进程：
 //   local-rss       定时抓取（跑完就退出，按 cron_restart 重跑）
 //   local-rss-http  常驻静态服务，把 output/*.xml 暴露成订阅地址
+//   local-rss-hub   常驻 WebSub hub，让 FreshRSS 能立刻收到更新
 //
 //   pm2 start ecosystem.config.js     # 启动（抓取任务会立刻跑一次）
 //   pm2 save                          # 存下进程列表
 //   pm2 logs local-rss                # 看抓取日志
 //   pm2 logs local-rss-http           # 看 HTTP 服务日志
+//   pm2 logs local-rss-hub            # 看 hub 日志（订阅/推送都打这里）
 //   pm2 restart local-rss             # 手动立刻抓一次
 //   pm2 restart local-rss-http        # 改了端口后重启服务
-//   pm2 delete local-rss local-rss-http
+//   pm2 delete local-rss local-rss-http local-rss-hub
 //
 // ⚠️ local-rss 是「跑完就退出」的一次性脚本，autorestart 必须为 false。
 //    否则 pm2 会把正常退出当成崩溃，无脑重启刷屏。
@@ -62,6 +64,28 @@ module.exports = {
       merge_logs: true,
       out_file: './logs/pm2-http-out.log',
       error_file: './logs/pm2-http-err.log',
+    },
+
+    {
+      name: 'local-rss-hub',
+      script: './hub.sh',
+      interpreter: 'bash',
+      cwd: __dirname,
+
+      // 常驻服务，挂了要拉起来
+      autorestart: true,
+
+      env: {
+        // WebSub hub 的端口 —— 改这里后 `pm2 restart local-rss-hub`
+        HUB_PORT: '8667',
+        // 只本机；对 tailnet 暴露靠 `tailscale serve --bg --tcp=8667 8667`
+        HUB_HOST: '127.0.0.1',
+      },
+
+      time: true,
+      merge_logs: true,
+      out_file: './logs/pm2-hub-out.log',
+      error_file: './logs/pm2-hub-err.log',
     },
   ],
 };

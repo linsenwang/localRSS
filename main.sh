@@ -6,6 +6,7 @@
 #   ./main.sh zhihu-kvxjr369f    只跑指定源（缺省跑 config.yaml 里全部启用的源）
 #   ./main.sh force bilibili-follow   两者组合
 #   ./main.sh clean              关掉遗留的浏览器标签页（进程被 kill -9 后可能残留）
+#   ./main.sh ping [源]          只 ping hub 通知有更新（不抓取，用来验证 hub 链路）
 #   ./main.sh status             看 pm2 进程 / 订阅地址 / 数据概览
 #   ./main.sh log [行数]         看最近抓取日志（默认 20 行）
 #   ./main.sh restart|stop|start 控制 pm2 里的定时抓取任务
@@ -29,7 +30,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PA
 
 PORT="$(grep -oE "PORT: *'[0-9]+'" ecosystem.config.js 2>/dev/null | grep -oE '[0-9]+' | head -1)"
 PORT="${PORT:-8666}"
-APPS="local-rss local-rss-http"
+APPS="local-rss local-rss-http local-rss-hub"
 LOG_FILE="$SCRIPT_DIR/logs/pm2-out.log"
 
 # 跟 pm2 相关但只在需要时才要求它存在
@@ -48,6 +49,17 @@ cmd_status() {
   echo "== 订阅地址 =="
   echo "  本机    http://127.0.0.1:$PORT/<feed-id>.xml"
   [ -n "$tsip" ] && echo "  tailnet http://$tsip:$PORT/<feed-id>.xml"
+  local hub
+  hub="$(python3 - <<'PY'
+import yaml
+try:
+    cfg = yaml.safe_load(open('config.yaml', encoding='utf-8')) or {}
+except Exception:
+    cfg = {}
+print(((cfg.get('output') or {}).get('hub_url') or '').strip())
+PY
+)"
+  [ -n "$hub" ] && echo "  hub     $hub"
   if command -v tailscale >/dev/null 2>&1; then
     tailscale serve status 2>/dev/null | head -1 | sed 's/^/  转发    /'
   fi
@@ -92,6 +104,12 @@ cmd_clean() {
   python3 "$SCRIPT_DIR/rss.py" --clean
 }
 
+# --ping 不需要浏览器，所以不走 run.sh（省得 WebBridge 没开就拒绝执行）。
+# PATH 已经在上面补过了。
+cmd_ping() {
+  python3 "$SCRIPT_DIR/rss.py" --ping "$@"
+}
+
 usage() {
   awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
 }
@@ -100,6 +118,7 @@ case "${1:-}" in
   "" )        exec "$SCRIPT_DIR/run.sh" ;;
   force)      shift; exec "$SCRIPT_DIR/run.sh" --force "$@" ;;
   clean)      shift; cmd_clean "$@" ;;
+  ping)       shift; cmd_ping "$@" ;;
   status)     shift; cmd_status "$@" ;;
   log)        shift; cmd_log "$@" ;;
   restart|stop|start)

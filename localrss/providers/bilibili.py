@@ -14,12 +14,18 @@ import re
 from datetime import datetime
 
 from ..bridge import Bridge
-from ..models import Item
+from ..models import Item, sort_key
 from . import register
 from .base import Provider
 
 API_FEED = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
 API_SPACE = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
+
+# 图文动态（MAJOR_TYPE_DRAW）现在有两套返回格式：不带这个参数时接口只回 major.draw
+# （纯图片、没有正文），带上之后按网页版的新格式回 major.opus —— 正文在
+# major.opus.summary.text 里，图片在 major.opus.pics 里。
+# 不带参数的后果就是实测里那些「发布了 N 张图片」的条目：动态其实都有正文，全被接口吃掉了。
+OPUS_FEATURES = "features=itemOpusStyle"
 DYNAMIC_URL = "https://t.bilibili.com/"
 VIDEO_URL = "https://www.bilibili.com/video/"
 PLAYER_URL = "https://player.bilibili.com/player.html"
@@ -199,7 +205,13 @@ def _bvids_of(item: Item) -> list[str]:
 
 # 已经渲染过的头像段 / 播放器 iframe，重复处理时先摘掉再按当前开关重新加
 _AVATAR_RE = re.compile(r'<p><img src="https://i\d\.hdslb\.com/bfs/face/[^"]*"[^>]*></p>')
-_PLAYER_RE = re.compile(r"<iframe [^>]*(?:player\.bilibili\.com|html5mobileplayer)[^>]*></iframe>")
+# 四种播放器都要能认出来：player.bilibili.com（desktop）+ blackboard/ 下的
+# html5player / html5mobileplayer / player。之前只写了 player.bilibili.com 和
+# html5mobileplayer，结果是配 html5player 时摘不掉旧的，每跑一次就多插一个 iframe。
+_PLAYER_RE = re.compile(
+    r'<iframe[^>]*\bsrc="[^"]*(?:player\.bilibili\.com|bilibili\.com/blackboard/)[^"]*"'
+    r"[^>]*></iframe>"
+)
 
 
 def _apply_avatar(item: Item, enabled: bool) -> None:
@@ -223,8 +235,20 @@ def _apply_player(item: Item, style: str) -> None:
     item.content = content
 
 
+def _dynamic_text(o: dict) -> str:
+    """动态的正文。两套格式：老的在 module_dynamic.desc.text，新的（opus）在 major.opus.summary.text。"""
+    return o.get("text") or (o.get("opus") or {}).get("summary", "") or ""
+
+
+def _pic_urls(o: dict) -> list[str]:
+    """动态里的图片。老的（major.draw）在 draw 里，新的（major.opus）在 opus.pics 里。"""
+    if o.get("draw"):
+        return list(o["draw"])
+    return list((o.get("opus") or {}).get("pics") or [])
+
+
 def _is_meaningful(o: dict) -> bool:
-    if o.get("text"):
+    if _dynamic_text(o):
         return True
     if any(o.get(k) for k in ("archive", "draw", "article", "opus", "common")):
         return True
@@ -232,12 +256,18 @@ def _is_meaningful(o: dict) -> bool:
 
 
 def _is_image_only(o: dict) -> bool:
-    """纯图动态：只有图片，没有正文，也没有视频/文章/转发等其他内容。"""
-    if o.get("text"):
+    """纯图动态：只有图片，没有正文，也没有视频/文章/转发等其他内容。
+
+    注意 opus 格式下「有正文」是看 opus.summary，不是 desc —— 只认 desc 的话，
+    带正文的图文动态会被误判成纯图。
+    """
+    if _dynamic_text(o):
         return False
-    if not o.get("draw"):
+    if not _pic_urls(o):
         return False
-    return not any(o.get(k) for k in ("archive", "article", "opus", "common", "orig"))
+    if (o.get("opus") or {}).get("title"):
+        return False  # 有标题的图文作品，不是随手发的图
+    return not any(o.get(k) for k in ("archive", "article", "common", "orig"))
 
 
 def _item_is_image_only(item: Item) -> bool:
@@ -249,6 +279,20 @@ def _item_is_image_only(item: Item) -> bool:
     if "<img " not in content:
         return False
     return not re.sub(r"<p><img [^>]*></p>", "", content).strip()
+
+
+def _item_is_digestable(item: Item) -> bool:
+    """是不是要收进合集的动态：发图（`DYNAMIC_TYPE_DRAW`）+ 转发（`DYNAMIC_TYPE_FORWARD`）。
+
+    判定用接口给的动态类型，所以 state 里存下来的老条目也认得出 —— 不看
+    `image_only` 标记（那个只看「有没有正文」，带正文的图文会被漏掉；
+    `--force` 重抓把它刷新一遍也不影响这里）。
+    """
+    kind = item.extra.get("type")
+    if kind:
+        return kind in DIGEST_DYNAMIC_TYPES
+    # 早期状态文件可能没存 type，那就只认「纯图」这种最保守的情况
+    return _item_is_image_only(item)
 
 
 def _is_self_repost(o: dict) -> bool:
@@ -270,6 +314,87 @@ def _item_is_self_repost(item: Item) -> bool:
     # 兼容早期状态文件：当时没存这个标记，就从渲染好的正文里认
     m = re.search(r"转发自 @([^<]*)", item.content or "")
     return bool(m) and bool(item.author) and m.group(1).strip() == item.author.strip()
+
+
+# ---------- 动态合集（image_digest_size）----------
+#
+# 「图片动态」和「转发」单发一条 RSS 提示太吵 —— 实测关注流两天 118 条里，
+# DYNAMIC_TYPE_DRAW 41 条（每天约 19）、DYNAMIC_TYPE_FORWARD 14 条。攒够 N 条
+# 合成一条「合集」，内容一条不落（作者 / 时间 / 正文 / 图片 / 原动态链接都在，
+# 转发里的视频播放器也照样嵌），只是不再单条刷屏。
+#
+# 合集本身是个普通条目（id 稳定、内容生成时定死），会跟别的条目一样存进 state，
+# 并且把「合成过哪几条」记在自己的 extra.digest_ids 里 —— 不需要额外的队列文件，
+# 反复运行 / --force 重抓都不会重复合成。
+
+#: 合集条目的 extra.kind，用来把它和真实动态区分开
+IMAGE_DIGEST_KIND = "image_digest"
+
+#: 会被收进合集的动态类型
+DRAW_DYNAMIC_TYPE = "DYNAMIC_TYPE_DRAW"
+FORWARD_DYNAMIC_TYPE = "DYNAMIC_TYPE_FORWARD"
+DIGEST_DYNAMIC_TYPES = (DRAW_DYNAMIC_TYPE, FORWARD_DYNAMIC_TYPE)
+
+
+def _age_seconds(dt: datetime | None) -> float:
+    """距现在多少秒。published 是本地 naive 时间，别用 sort_key（它按 UTC 解释）。"""
+    if dt is None:
+        return 0.0
+    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+    return (now - dt).total_seconds()
+
+
+def _digested_ids(items: list[Item]) -> set[str]:
+    """已经并进合集的条目 id（从合集条目自己的 extra.digest_ids 推出来）。"""
+    out: set[str] = set()
+    for i in items:
+        if i.extra.get("kind") == IMAGE_DIGEST_KIND:
+            out.update(i.extra.get("digest_ids") or [])
+    return out
+
+
+def _digest_title(batch: list[Item]) -> str:
+    """合集标题：`动态合集 <作者…>`（同一批发过言的作者全列出来，去重、按时间顺序）。"""
+    names: list[str] = []
+    for i in batch:
+        if i.author and i.author not in names:
+            names.append(i.author)
+    return f"动态合集 {'、'.join(names)}" if names else "动态合集"
+
+
+def _digest_entry_html(item: Item, show_avatar: bool) -> str:
+    head: list[str] = []
+    face = item.extra.get("face")
+    if show_avatar and face:
+        head.append(
+            f'<img src="{_esc(_abs_url(face))}" width="32" height="32"'
+            f' alt="{_esc(item.author)}">'
+        )
+    who = _esc(item.author)
+    head.append(f'<a href="{_esc(item.link)}">{who}</a>' if item.link else who)
+    if item.published:
+        head.append(item.published.strftime("%Y-%m-%d %H:%M"))
+    # content 就是这条动态渲染好的正文（文字 + 图片）；如果之前渲染过头像，先摘掉，
+    # 合集里由头行统一表示。
+    body = _AVATAR_RE.sub("", item.content or "")
+    return "<p>" + " · ".join(h for h in head if h) + "</p>" + body
+
+
+def _build_digest(batch: list[Item], show_avatar: bool) -> Item:
+    """把一批图片动态（按时间从旧到新）合成一个条目。"""
+    newest = batch[-1]
+    local = batch[0].id.split(":", 1)[-1]  # bilibili:<动态id> -> <动态id>
+    return Item(
+        id=f"bilibili:imgdigest:{local}",
+        title=_digest_title(batch),
+        link=newest.link or DYNAMIC_URL,
+        published=newest.published,
+        content="".join(_digest_entry_html(i, show_avatar) for i in batch),
+        extra={
+            "kind": IMAGE_DIGEST_KIND,
+            "digest_ids": [i.id for i in batch],
+        },
+    )
 
 
 def _content_html(o: dict) -> str:
@@ -353,14 +478,16 @@ def _title(o: dict) -> str:
         return opus["title"]
     if common.get("title"):
         return common["title"]
-    line = _first_line(o.get("text", ""))
+    line = _first_line(_dynamic_text(o))
     if line:
         return line
-    if o.get("draw"):
-        return f"发布了 {len(o['draw'])} 张图片"
+    pics = _pic_urls(o)
+    if pics:
+        return f"发布了 {len(pics)} 张图片"
     if o.get("orig"):
-        if _first_line(o["orig"].get("text", "")):
-            return "转发：" + _first_line(o["orig"]["text"])
+        orig_line = _first_line(_dynamic_text(o["orig"]))
+        if orig_line:
+            return "转发：" + orig_line
         return "转发自 @" + (o["orig"].get("name") or "未知")
     return "动态"
 
@@ -377,11 +504,11 @@ class BilibiliProvider(Provider):
 
     def _page_url(self, page: int, offset: str | None) -> str:
         if self.opt("mode", "feed") == "space":
-            url = f"{API_SPACE}?host_mid={self.require('uid')}&timezone_offset=-480"
+            url = f"{API_SPACE}?host_mid={self.require('uid')}&timezone_offset=-480&{OPUS_FEATURES}"
             if offset:
                 url += f"&offset={offset}"
             return url
-        url = f"{API_FEED}?timezone_offset=-480&type=all&page={page}"
+        url = f"{API_FEED}?timezone_offset=-480&type=all&page={page}&{OPUS_FEATURES}"
         if offset:
             url += f"&offset={offset}"
         return url
@@ -435,18 +562,71 @@ class BilibiliProvider(Provider):
             },
         )
 
+    def _digest_max_age_s(self) -> float:
+        """图片动态攒不满 size 时的兜底有效期（小时），0 = 不兜底（一直攒着）。"""
+        try:
+            hours = float(self.opt("image_digest_max_age_hours", 24))
+        except (TypeError, ValueError):
+            hours = 24.0
+        return max(0.0, hours) * 3600
+
+    def _apply_image_digest(
+        self, items: list[Item], size: int, max_age_s: float, show_avatar: bool
+    ) -> tuple[list[Item], list[Item], int]:
+        """把图片动态/转发攒成合集。返回（可见列表，本次新建的合集条目，收进合集的条数）。
+
+        - 这些条目自己不进 RSS（没并进合集的在里面等着，并过的也不单独出现）；
+        - 攒够 size 条就出一批（先出旧的）；不足 size 但最旧那条超过 max_age_s 也出一批。
+        """
+        digested = _digested_ids(items)
+        image_items = [i for i in items if _item_is_digestable(i)]
+        visible = [i for i in items if not _item_is_digestable(i)]
+        pending = sorted((i for i in image_items if i.id not in digested), key=sort_key)
+
+        new: list[Item] = []
+        while len(pending) >= size:
+            batch, pending = pending[:size], pending[size:]
+            new.append(_build_digest(batch, show_avatar))
+        if pending and max_age_s > 0 and _age_seconds(pending[0].published) >= max_age_s:
+            new.append(_build_digest(pending, show_avatar))
+        return visible + new, new, len(image_items)
+
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
+        # items 是 cli 之后要落盘的那个列表（store.save(merged)），
+        # 新建的合集必须留在里面，否则下次运行看不到 digest_ids，同一批图片会被重复合成。
+        merged = items
         items = super().postprocess(items, bridge)
         if self.opt("filter_self_repost", True):
             items = [i for i in items if not _item_is_self_repost(i)]
-        if self.opt("filter_image_only", True):
+
+        show_avatar = bool(self.opt("show_avatar", True))
+        try:
+            digest_size = int(self.opt("image_digest_size", 0) or 0)
+        except (TypeError, ValueError):
+            digest_size = 0
+
+        new_digests: list[Item] = []
+        if digest_size > 0:
+            # 开了合集：图片动态和转发一律进合集，filter_image_only 不再参与
+            items, new_digests, self.grouped_items = self._apply_image_digest(
+                items, digest_size, self._digest_max_age_s(), show_avatar
+            )
+        elif self.opt("filter_image_only", True):
             items = [i for i in items if not _item_is_image_only(i)]
+
+        if new_digests:
+            merged.extend(new_digests)
+            merged.sort(key=sort_key, reverse=True)
+            self.derived_items += len(new_digests)
+            for d in new_digests:
+                print(f"    [动态合集] 合成 {len(d.extra['digest_ids'])} 条：{d.title}")
 
         # 头像和播放器在这里加/摘，而不是抓取时定死 —— 这样改开关立刻生效，
         # 不用重抓（两个操作都是幂等的：先摘掉旧的，再按当前开关加回去）。
-        show_avatar = bool(self.opt("show_avatar", True))
+        # 合集条目也照走一遍：它正文里那些「作者 · 时间」头行不会被 _AVATAR_RE 匹配
+        # （那个正则要求 <p> 里只有头像），播放器则会按正文里的视频链接补进转发条目。
         style = _player_style(self.opt("embed_player", "mobile"))
         for item in items:
             _apply_avatar(item, show_avatar)
             _apply_player(item, style)
-        return items
+        return sorted(items, key=sort_key, reverse=True)

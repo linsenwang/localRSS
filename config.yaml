@@ -22,8 +22,19 @@ output:
   # 注意这是「条数」上限，不按体积算：带全文的源每条体积大得多，所以单独调小了。
   history: 150
   # 订阅服务的地址前缀（由 pm2 里的 local-rss-http 提供，端口见 ecosystem.config.js）。
-  # 用于 RSS 里的 <atom:link rel="self">。
-  base_url: http://127.0.0.1:8666
+  # 用于 RSS 里的 <atom:link rel="self">，也是 WebSub 通知 hub 时用的 feed 地址。
+  # 注意：这必须是**订阅者和 hub 都用得到的地址**。FreshRSS 拿它当 WebSub 的 topic，
+  # 所以填 127.0.0.1 的话 hub 会去抓一个只在本机存在的地址，抓不到就白推。
+  base_url: http://100.117.207.33:8666
+
+  # WebSub：内容有更新时 ping 一下 hub，hub 就来抓 feed 并推给订阅者
+  # （FreshRSS 秒收，不用等它自己轮询）。留空 = 关闭，RSS 里也不会出现 hub 声明。
+  #
+  # 指向本机那个自建 hub（local-rss-hub，见 hub.sh / localrss/hub.py），
+  # 它同时够得到这台机器的 feed 和 tailnet 上 aliyun 那台的 FreshRSS。
+  # 公共 hub（https://websubhub.com/ 之类）用不了 —— 它们在公网上，抓不到 tailnet 里的 feed。
+  # 详见 README 的「WebSub」一节。单个源可以在 feeds 里用 hub 键覆盖。
+  hub_url: http://100.117.207.33:8667/
 
 # 全局关键词过滤：标题或正文命中任一关键词的条目会被丢掉（大小写不敏感的子串匹配）。
 # 对所有 feeds 生效，去掉/关掉就把整个列表清空。
@@ -64,7 +75,17 @@ feeds:
       max_pages: 3     # 每页约 20 条，抓满 max_pages 或遇到已有记录就停
       # 过滤掉「转发自 @自己」的回环转发（转发的原动态就是本人发的）
       filter_self_repost: true
-      # 过滤掉纯图动态（只有图片、没有正文的那些）
+      # 「图片动态」（DYNAMIC_TYPE_DRAW，带不带正文都算）和「转发」
+      # （DYNAMIC_TYPE_FORWARD）单发一条太吵 —— 实测两天 41 + 14 条。
+      # 攒够 image_digest_size 条就合成一条合集再进 RSS，内容一条不落
+      # （作者/时间/正文/图片/链接都在，转发里的视频播放器也照样嵌）。
+      # 设成 0 则关掉合集，退回下面的老行为。详见 README 的「动态合集」。
+      image_digest_size: 10
+      # 攒不满 image_digest_size 时的兜底：最旧的那条超过这个小时数就照样合成一条，
+      # 免得冷清的时候几条内容一直不出现在 RSS 里。设成 0 = 不兜底（一直攒着）。
+      image_digest_max_age_hours: 24
+      # 上面的 image_digest_size > 0 时本项不再生效；image_digest_size = 0 时才是
+      # 「过滤掉纯图动态」
       filter_image_only: true
       # 在每条正文开头放 UP 主头像（RSS 没有「每条一个图标」的字段，只能这样带出来）
       show_avatar: false
@@ -117,6 +138,16 @@ feeds:
     history: 60          # 同上，带全文，别用全局默认的 150
     options:
       token: GalAster
+
+  - id: zhihu-yuhang-liu
+    type: zhihu
+    title: yuhang-liu
+    description: 知乎个人主页动态
+    site_url: https://www.zhihu.com/people/yuhang-liu-34
+    enabled: true
+    history: 60          # 同上，带全文，别用全局默认的 150
+    options:
+      token: yuhang-liu-34
 
   # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
   # - id: bilibili-up

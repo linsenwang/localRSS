@@ -20,6 +20,7 @@ class FeedConfig:
     file: str = ""
     enabled: bool = True
     history: int | None = None  # 覆盖 output.history；None 表示用全局默认
+    hub_url: str = ""  # 覆盖 output.hub_url；空字符串表示用全局默认
     options: dict = field(default_factory=dict)
 
     @property
@@ -38,6 +39,7 @@ class Config:
     state_dir: Path
     history: int
     base_url: str
+    hub_url: str
     close_session: bool
     exclude_keywords: list[str]
     feeds: list[FeedConfig]
@@ -88,6 +90,7 @@ def load_config(path: str | Path) -> Config:
                 file=entry.get("file") or "",
                 enabled=bool(entry.get("enabled", True)),
                 history=int(entry["history"]) if entry.get("history") else None,
+                hub_url=str(entry.get("hub") or "").rstrip("/"),
                 options=dict(entry.get("options") or {}),
             )
         )
@@ -102,6 +105,7 @@ def load_config(path: str | Path) -> Config:
         state_dir=resolve(output_cfg.get("state_dir"), "state"),
         history=int(output_cfg.get("history", 300)),
         base_url=str(output_cfg.get("base_url") or "").rstrip("/"),
+        hub_url=str(output_cfg.get("hub_url") or "").rstrip("/"),
         close_session=bool(bridge_cfg.get("close_session", True)),
         exclude_keywords=[
             str(k) for k in (raw.get("exclude_keywords") or []) if str(k).strip()

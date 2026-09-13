@@ -59,6 +59,7 @@ python3 rss.py --list-types    # 列出已支持的站点类型
 ./main.sh zhihu-kvxjr369f  # 只跑指定源
 ./main.sh force bilibili-follow   # 组合
 ./main.sh clean            # 关掉遗留的浏览器标签页
+./main.sh ping             # 只 ping hub 通知有更新（不抓取，用来验证 WebSub 链路）
 ./main.sh status           # pm2 进程 / 订阅地址 / 数据概览
 ./main.sh log 50           # 最近 50 行抓取日志
 ./main.sh restart          # 重启 pm2 抓取任务（等于立刻跑一次）
@@ -122,6 +123,7 @@ rm state/*.json && ./main.sh
 | `filter_self_repost` / `filter_image_only` | **立即** |
 | `dedupe_by_content` | **立即** |
 | `show_avatar` / `embed_player` | **立即** |
+| `image_digest_size` / `image_digest_max_age_hours` | 下次运行。**正文会跟着重渲染，但已经分好的批次不会重排** —— 要重来就删掉 state 里那些 `extra.kind == "image_digest"` 的条目 |
 | `max_pages` / `fulltext` / `max_fulltext_per_run` | 下次运行 |
 | 标题格式、正文结构这类**渲染逻辑**的改动 | 要 `./main.sh force` |
 
@@ -170,13 +172,16 @@ http://127.0.0.1:8666/zhihu-kvxjr369f.xml
 订阅地址换成这台机器的局域网 IP（`ipconfig getifaddr en0`）。
 注意那会把 RSS 暴露给同局域网的所有设备 —— 这个 feed 里有你关注谁、收藏了什么。
 
-`config.yaml` 里的 `output.base_url` 要和这个端口保持一致，
+`config.yaml` 里的 `output.base_url` 要和这个端口（以及你**实际用来访问的地址**）一致，
 它决定 RSS 内部的 `<atom:link rel="self">`：
 
 ```yaml
 output:
-  base_url: http://127.0.0.1:8666
+  base_url: http://100.117.207.33:8666
 ```
+
+（这里原先是 `127.0.0.1`，开了 WebSub 之后改成了 tailnet 地址：FreshRSS 拿这个 self
+地址当 WebSub 的 topic，hub 也得能抓它，而 `127.0.0.1` 对别的机器没有任何意义。）
 
 想临时手动起一个（不用 pm2）也可以：
 
@@ -233,8 +238,172 @@ Tailscale 挂了不影响本机使用；要改成绑 tailnet 网卡（不用 ser
 HOST: '0.0.0.0',          // 绑所有网卡：tailnet 和局域网都能访问
 ```
 
-`config.yaml` 里的 `output.base_url` 只是 RSS 内部的 `<atom:link rel="self">`，
+`config.yaml` 里的 `output.base_url` 决定 RSS 内部的 `<atom:link rel="self">`，
 不影响抓取；如果阅读器不介意，留 `127.0.0.1` 也没问题。
+**但开启 WebSub 后它还会被当成「feed 的地址」告诉 hub**，那时就必须填订阅者用的那个地址（见下）。
+
+## WebSub（更新推送）
+
+默认是阅读器**自己定时来拉** feed（FreshRSS 一般 1 小时一次），所以就算抓取每 30 分钟跑一次，
+手机上也可能要等一小时才看到。WebSub 把它改成「有更新就推」：feed 里声明一个 hub，
+我们抓完发现有新条目就 ping 一下 hub，hub 立刻来抓 feed 并推给所有订阅者。
+
+### 怎么开
+
+在 `config.yaml` 的 `output` 下填 hub 地址即可（单个源可以用 `hub` 键覆盖）：
+
+```yaml
+output:
+  base_url: http://100.117.207.33:8666   # 订阅地址，也是通知 hub 时用的 feed 地址
+  hub_url: http://100.117.207.33:8667/   # hub 地址；留空 = 关闭
+```
+
+开了之后：
+
+- `output/*.xml` 会多一行 `<atom:link href="..." rel="hub"/>`，阅读器订阅时据此知道该去哪个 hub 注册；
+- 每次抓取**有新条目**时自动 ping 一次 hub（没新内容那种常见运行就不打扰它）；
+- 留空则一切照旧，RSS 里也不会出现 hub 声明。
+
+### ⚠️ hub 必须能自己抓到 feed
+
+hub 是主动方：收到通知后它要去 fetch feed 拿内容，再推给订阅者。所以三个方向都得通：
+
+| 谁 | 要连谁 | 前提 |
+|---|---|---|
+| hub | 你的 feed（`base_url` 那个地址） | feed 对 hub 可达 |
+| 阅读器 | hub（订阅时注册回调地址） | hub 对阅读器可达 |
+| hub | 阅读器（推送回调，FreshRSS 是 `p/api/`） | 阅读器的 `base_url` 对 hub 可达 |
+
+**公共 hub 配不上这套**：`https://websubhub.com/`、`https://pubsubhubbub.appspot.com/`
+都是公网服务，抓不到 `100.117.207.33` 这种 tailnet 地址。要让它们能用，得先
+`tailscale funnel --bg --tcp=8666 8666` 把 feed 暴露到公网 —— 那等于把你关注谁、
+收藏了什么公开出去，别这么干。
+
+**自建 hub 才是对的路子**，而这个项目里就带了一个：`localrss/hub.py`，跑成 pm2 的
+`local-rss-hub`（见 `hub.sh`）。纯标准库实现，不做重试、不做多余花活，够用就行。
+它跑在这台机器上，三方全在 tailnet 内闭环：
+
+```
+FreshRSS ──① 订阅 ──▶ http://100.117.207.33:8667/   （本机 hub）
+   ▲                          │
+   │                     ② 抓 feed
+   │                          ▼
+   └──③ 推送内容──── http://100.117.207.33:8666/*.xml（本机 feed 服务）
+```
+
+hub 本身只需要本机可达，对 tailnet 的暴露沿用 feed 那一套：
+
+```bash
+tailscale serve --bg --tcp=8667 8667    # 一次性配置，之后一直有效
+tailscale serve --tcp=8667 off          # 关掉
+```
+
+订阅关系存在 `state/hub.json`，重启不丢；打开 `http://100.117.207.33:8667/` 能看到
+当前有哪些订阅、租期还剩多久。hub 的日志在 `pm2 logs local-rss-hub`。
+
+FreshRSS 那边（`data/config.php`）：
+
+```php
+'base_url' => 'http://47.120.35.57:8080/',   // 这台实例实际的 base_url
+'pubsubhubbub_enabled' => true,
+```
+
+只有 `base_url` 看起来是公网地址、**或者 hub 和 `base_url` 同主机**时它才会启用 WebSub
+（`pubSubHubbubPrepare()` 里的判断）。而 `serverIsPublic()` 只排除 RFC1918 那几个网段，
+**不认 `100.64.0.0/10`** —— tailnet 的 `100.x` 地址在它眼里就是「公网」。这台实例
+`base_url` 又正好是公网 IP（`47.120.35.57:8080`），所以 WebSub 会正常启用。
+
+### FreshRSS 侧的实测情况（1.26.0）
+
+进容器里直接看过，**不需要改任何配置**：
+
+```php
+'base_url' => 'http://47.120.35.57:8080',   // 公网 IP，serverIsPublic() 判定为 true
+'pubsubhubbub_enabled' => true,             // 本来就开着
+```
+
+- 4 个源在 `feed` 表里登记的 `url` 就是 `http://100.117.207.33:8666/<id>.xml`，
+  和我们生成的 `rel="self"` 一致，所以 WebSub 的 topic 天然对得上；
+- **1.26.0 里没有那道 SSRF 黑名单**：`100.64.0.0/10`、`internal_host_allowlist`、
+  `PRIVATE_SUBNETS` 在整个仓库里都搜不到。所以它抓 `100.x` 的 feed、POST 到 `100.x`
+  的 hub，都不会被拦。
+
+> ⚠️ 以后**升级 FreshRSS 要注意**：新版（edge / 1.27+）加了 `app/Utils/httpUtil.php`，
+> 里面的 `PRIVATE_SUBNETS` 明确包含 `100.64.0.0/10`。升上去之后就得在
+> `data/config.php` 里补一行，否则 feed 和 hub 会一起被拦：
+>
+> ```php
+> 'internal_host_allowlist' => ['100.64.0.0/10'],
+> ```
+>
+> 用 CIDR，别写成带端口的 `100.117.207.33:8666` —— hub 在 8667 上。
+> 症状是 `log_pshb.txt` 里出现
+> `Fetching this URL is not allowed, because the host's IP is not in the allowlist`。
+
+**什么时候会订阅**：FreshRSS 的每源刷新间隔是 `ttl_default = 3600`（一小时），
+所以 feed 里多了 hub 声明之后，要等这个源下一次真正被拉取才会被发现。容器自己的
+cron 是 `CRON_MIN=1,31`（每小时 :01 和 :31 跑一次 `app/actualize_script.php`），
+但每轮只刷新「距上次更新超过 1 小时」的源 —— 手动跑 `actualize_script.php` 也一样会被
+TTL 跳过。想立刻生效，就在 FreshRSS 界面上对这几个源点一下刷新。
+
+本实例已经把这 4 个源的 `ttl` 从 `0`（= 继承 `ttl_default` 3600）改成 **`900`**，
+所以每轮 cron 都会刷。要改回去：
+
+```sql
+UPDATE feed SET ttl = 0 WHERE url LIKE 'http://100.117.207.33:8666/%';
+```
+
+> 顺带发现的另一件事：FreshRSS 抓每个源的超时是 **20 秒**（日志里
+> `cURL error 28: ... after 20001 milliseconds`），而这几个 feed 有 150~420 KB，
+> 走 tailnet 偶尔会超时（实测 4 个里有 2 个中招，下一轮就正常了）。超时的源会被标
+> `error=1` 并重试，**和 WebSub 无关** —— 那个标记只表示「这次抓取失败」。
+> 真嫌它烦，可以给这几个源单独加大 curl 超时。
+
+订阅是 FreshRSS 自己发起的：它每次刷新 feed 都会重读一遍 hub 声明，发现同时有
+`rel="hub"` 和 `rel="self"` 就自动往 hub 订阅（`feedController.php` 里的
+`pubSubHubbubPrepare()` / `pubSubHubbubSubscribe()`），**不需要手动操作**。之后：
+
+- 订阅成功 → hub 立刻推一次当前内容 → 它把 WebSub 标成可用；
+- 每次抓取有新条目 → 我们 ping hub → hub 抓 feed → 推给 FreshRSS → **秒收**；
+- 如果某次是它自己轮询才发现新文章（说明推送没生效），它会打 warning 并暂时退回
+  普通轮询，约 23 小时后重试订阅 —— 所以配好后隔一轮刷新去看日志最靠谱。
+
+这些情况都记在 `./FreshRSS/data/users/_/log_pshb.txt`。
+
+### 验证
+
+```bash
+./main.sh ping              # 只通知 hub，不抓取，不需要浏览器
+./main.sh ping zhihu-nell   # 只通知指定源
+```
+
+```
+[bilibili-follow] 已通知 hub（HTTP 204）：http://100.117.207.33:8666/bilibili-follow.xml
+```
+
+204 就是「收到了」。地址写错或 hub 没起来只会往 stderr 打一条 `WebSub 通知失败：…`，
+**不影响抓取本身**，也不会让定时任务算失败。日常抓取里有新条目时会自动做同样的事。
+
+FreshRSS 文档里推荐的那几个在线测试服务在这儿**基本用不上**：websub.rocks 和
+test.livewire.io 都是公网服务，得能自己访问到你的 hub / topic，只绑在 tailnet 上的 hub
+它们够不到。（`push-tester.cweiske.de` 官方文档只提了一句，具体用法没查到，不指望它。）
+
+所以验证就靠本地这几条：
+
+```bash
+curl http://100.117.207.33:8667/     # hub 上登记了哪些订阅，应该能看到 FreshRSS 的 pshb.php
+./main.sh ping                       # 手动触发一次通知，不需要浏览器
+pm2 logs local-rss-hub               # hub 侧的验签 / 抓取 / 推送全过程
+```
+
+排查顺序：
+
+| 现象 | 多半是 |
+|---|---|
+| hub 日志里完全没有验签记录 | FreshRSS 还没订阅 —— 先确认它在抓 feed、没被 SSRF 拦住、feed 里确实有 `rel="hub"` |
+| 有验签，但推送一直失败 | 它登记的回调地址 hub 访问不到（看日志里那串 `api/pshb.php?k=…`） |
+| `./main.sh ping` 报「连不上 hub」 | hub 没起来，或 `hub_url` 写错 |
+| hub 日志里说「抓 feed 失败」 | `curl <base_url>/<feed-id>.xml` 试一下 —— 抓不到这个地址，后面全都是白搭 |
 
 ## 标签页清理
 
@@ -291,12 +460,13 @@ bridge:
 
 ## 定时刷新（持久化）
 
-pm2 管两个进程：
+pm2 管三个进程：
 
 | 进程 | 作用 | 特性 |
 |------|------|------|
 | `local-rss` | 定时抓取 | 跑完就退出，`cron_restart` 到点重跑，`pm2 list` 里显示 `stopped` 是正常的 |
 | `local-rss-http` | 常驻订阅服务 | `autorestart: true`，挂了自动拉起 |
+| `local-rss-hub` | 常驻 WebSub hub | 同上；只服务自己的几个 feed，日志看 `pm2 logs local-rss-hub` |
 
 **刷新间隔写在 `ecosystem.config.js` 的 `cron_restart` 里，不是 `config.yaml`。**
 （`config.yaml` 只管抓什么源；多久跑一次是调度器的事。）
@@ -394,7 +564,8 @@ output:
   dir: output        # RSS 输出目录（相对 config.yaml 所在目录）
   state_dir: state   # 去重/增量用的状态目录
   history: 150       # 每个源最多保留多少条（可被各 feed 的 history 覆盖）
-  base_url: ""       # 可选，服务地址前缀
+  base_url: ""       # 可选，服务地址前缀（开了 WebSub 后就是 hub 抓 feed 用的那个地址）
+  hub_url: ""        # 可选，WebSub hub 地址；留空 = 关闭（见「WebSub」一节）
 
 # 全局关键词过滤：标题或正文命中任一关键词的条目会被丢掉。
 # 对所有 feeds 生效，不想要就清空这个列表。
@@ -426,7 +597,9 @@ feeds:
 | `uid` | — | `mode: space` 时必填，UP 主的 UID |
 | `max_pages` | `3` | 最多翻几页，每页约 20 条 |
 | `filter_self_repost` | `true` | 过滤掉「转发自 @自己」的回环转发 |
-| `filter_image_only` | `true` | 过滤掉纯图动态（只有图片、没有正文的） |
+| `image_digest_size` | `0` | 攒够这么多条「图片动态 + 转发」就合成一条合集（`0` = 关掉，见下） |
+| `image_digest_max_age_hours` | `24` | 攒不满的兜底有效期，小时；`0` = 不兜底 |
+| `filter_image_only` | `true` | 过滤掉纯图动态。**`image_digest_size > 0` 时本项不生效**（纯图走合集） |
 | `show_avatar` | `true` | 在每条正文开头放 UP 主头像（改开关立即生效） |
 | `embed_player` | `html5player` | 视频内嵌播放器：`mobile` / `html5player` / `desktop` / `newplayer` / `false`（改开关立即生效） |
 
@@ -440,7 +613,17 @@ feeds:
 ```
 
 这样光看标题就知道是谁发的（很多阅读器不会把 `dc:creator` 显示在列表里）。
-其余类型保持原样：`发布了文章：…`、转发取转发的正文首行、纯文字动态取正文首行。
+其余类型保持原样：`发布了文章：…`、转发取转发的正文首行、纯文字动态取正文首行，
+**图文动态取正文（`opus.summary`）首行**，实在没正文又没标题的才叫 `发布了 N 张图片`。
+
+```
+最近GTA5最大私服社区NopixelV开始内测了
+《可能的爱情》获威尼斯电影节评审团大奖。
+想与各位分享一个喜讯，影视飓风出品的《鸽环》，在第83届威尼斯国际电影节获得了沉浸式单元大奖！
+```
+
+（图片动态以前这里全是 `发布了 N 张图片`，原因是接口少传了参数，见
+「图文动态的正文哪去了」。）
 
 ### zhihu 的标题格式
 
@@ -600,13 +783,93 @@ exclude_keywords:
 转发自己的动态（`作者 == 转发的原作者`，按 mid 判断）没有任何信息量，直接丢掉。
 实测 57 条里筛掉 4 条；转发**别人**的照常保留。
 
-### bilibili · `filter_image_only`
+### bilibili · `filter_image_only` 与动态合集
 
-纯图动态：只有图片、没有正文，也没有视频/文章/转发等其他内容。
-实测 57 条里有 **20 条**属于这类（占了三分之一），标题会变成「发布了 N 张图片」那种。
+**先说结论：B 站的图片动态其实都有正文，之前「图文动态只剩图片」不是过滤器干的，
+是接口少传了一个参数。** 详见下面的「图文动态的正文哪去了」。
 
-判定依据是「有图片 **且** 除图片段外没有任何其他内容」，所以**带文字的图照样保留**，
-只是碰巧有封面图的视频也不会被误伤。开关关掉就是 57 条里的 53 条（只掉自转发）。
+`filter_image_only` 丢的是**真正的**纯图动态：有图片，但标题/正文/视频/文章/转发
+一个都没有。判定用 `major.opus.summary`（新格式）或 `desc.text`（老格式），
+所以带正文的图文不会被误伤。**只在 `image_digest_size: 0` 时才用得上这一项** ——
+开了合集之后纯图走合集，不再直接丢。
+
+`image_digest_size` 是它的替代方案（也是 `config.yaml` 里的做法）：
+
+```yaml
+      image_digest_size: 10            # 攒够 10 条图片动态/转发合成一条「合集」
+      image_digest_max_age_hours: 24   # 攒不满的兜底有效期，0 = 不兜底
+```
+
+- `image_digest_size: 0`（代码默认）= 关掉合集，回到「纯图直接丢」的老行为；
+- `> 0` = 图片动态和转发一律进合集，`filter_image_only` 不再参与。
+
+### bilibili · 动态合集（`image_digest_size`）
+
+**发图 + 转发**一条一条刷屏很吵，但直接丢掉又可惜。合集的做法是**攒够 N 条再合成一条**
+进 RSS。实测关注流两天 118 条里：`DYNAMIC_TYPE_DRAW` 41 条（≈19/天）、
+`DYNAMIC_TYPE_FORWARD` 14 条 —— 合计 55 条（≈25/天），够开 5 个合集，
+省掉 50 条单条条目。
+
+标题统一是 `动态合集 <作者…>`（这一批发过言的作者全列出来，去重、按时间顺序，不带条数）：
+
+```
+动态合集 旋风凉水、特厨魏味-、游戏星GameStar、卧烟同人社、ASPT-航天科普小组
+```
+
+正文里每条一段：`头像（show_avatar 开着时）· 作者（链到原动态）· 时间`，
+下面接这条动态的正文和图片 —— **内容一条不落**，转发里的视频也会照常嵌播放器。
+
+几条规则：
+
+- **进合集的是**：`DYNAMIC_TYPE_DRAW`（发图，带不带正文都算）+ `DYNAMIC_TYPE_FORWARD`
+  （转发）。判定看接口给的动态类型，所以 state 里的老条目也认得出，
+  不依赖 `image_only` 标记（那个只看「有没有正文」）；
+- **不进合集的是**：原创视频（`DYNAMIC_TYPE_AV`）、文章（`DYNAMIC_TYPE_ARTICLE`）、
+  纯文字动态 —— 它们本来就是一条一条的正常内容；
+- **先出旧的**：攒够 N 条就从最旧的开始切一批，剩下的继续等下一批；
+- **兜底**：剩下的不足 N 条、且最旧那条已经超过 `image_digest_max_age_hours` 小时，
+  就按现有条数照样出一条 —— 免得冷清的时候几条内容永远不出现在 RSS 里。
+  设成 `0` 就是「一直攒着，攒够才出」。
+
+实现上不需要额外的队列文件：合集是个普通条目，存进 `state/*.json`，
+并且把「合成过哪几条」记在自己的 `extra.digest_ids` 里。所以
+
+- 每次运行都是幂等的：同一批不会重复合成（`--force` 重抓也一样）；
+- 没被合成的条目只是不进 RSS，state 里照旧留着，改小 `image_digest_size` 就会看到它们；
+- **合集条目的正文也是每次运行重渲染的**（和单条一样先摘后加），所以改
+  `show_avatar` / `embed_player` 对合集同样立即生效 —— 只有**标题和成员**是合成时定死的，
+  想重新分批要删掉 state 里那些 `extra.kind == "image_digest"` 的条目。
+
+> 顺带修了个播放器的老 bug：`_PLAYER_RE` 原来只认 `player.bilibili.com` 和
+> `html5mobileplayer`，而 `config.yaml` 用的 `html5player` 落在 `blackboard/` 下 ——
+> 于是「先摘旧的、再加回去」对它是失效的，**每跑一次就多插一个 iframe**
+> （state 里能看到 `iframe x 3` 的条目）。现在正则覆盖四种播放器风格，重复运行稳定在 1 个。
+
+### bilibili · 图文动态的正文哪去了（`features=itemOpusStyle`）
+
+这个坑值得单独记一笔：**图文动态（`DYNAMIC_TYPE_DRAW`）现在有两套返回格式。**
+
+| 请求 | `major.type` | 正文 | 图片 |
+|---|---|---|---|
+| 不带 `features` | `MAJOR_TYPE_DRAW` | **没有**（`desc` 是 `null`） | `major.draw.items` |
+| `features=itemOpusStyle` | `MAJOR_TYPE_OPUS` | `major.opus.summary.text` | `major.opus.pics` |
+
+网页版（t.bilibili.com）用的是后者，我们之前用的是前者 —— 于是所有图文动态
+在本地都成了「只有图片、没有正文」，标题变成 `发布了 N 张图片`，
+然后被 `filter_image_only` 当纯图丢掉。**正文其实一直都在，只是没问接口要。**
+
+修法是给两个接口 URL 都加 `features=itemOpusStyle`（见 `OPUS_FEATURES`），
+同时把 `_is_image_only` / `_title` 的「有没有正文/有没有图」改成认两套字段
+（`_dynamic_text()` / `_pic_urls()`），否则 opus 格式下正文在 `opus.summary` 里，
+只认 `desc.text` 还是会把带正文的图文误判成纯图。
+
+用 WebBridge 在真实页面里核对过（`api.bilibili.com/.../detail` + 页面 DOM 对照）：
+`opus.summary.text` 和页面上显示的正文一字不差，`has_more: false` 说明没被截断。
+
+> ⚠️ 正文是抓取时渲染进 `content` / `title` 的，**存在 state 里**。
+> 所以这次改动之后要 `./main.sh force` 重抓一遍，存量条目才会跟着更新。
+> 又因为 force 只翻 `max_pages` 页，比这个窗口更老的条目不会重渲 ——
+> 想让它们也补上，临时把 `max_pages` 调大（比如 6）跑一次 force，再改回来即可。
 
 ### bilibili · `show_avatar`
 
@@ -735,12 +998,14 @@ pin ID。不想要这个行为就把 `dedupe_by_content` 设成 `false`。
 
 ```
 local_rss/
-├── config.yaml              # 源配置（抓什么）+ base_url
-├── ecosystem.config.js      # pm2 配置（cron_restart 间隔、订阅服务端口）
+├── config.yaml              # 源配置（抓什么）+ base_url + hub_url
+├── ecosystem.config.js      # pm2 配置（三个进程、cron_restart 间隔、端口）
 ├── rss.py                   # 抓取入口
+├── rss-hub.py               # WebSub hub 入口（一般由 pm2 的 local-rss-hub 拉起）
 ├── run.sh                   # 定时抓取入口（补 PATH + 确保 WebBridge 在跑）
-├── main.sh                  # 本地手动入口（force/clean/status/log/restart）
+├── main.sh                  # 本地手动入口（force/clean/ping/status/log/restart）
 ├── serve.sh                 # 常驻订阅服务（静态提供 output/*.xml）
+├── hub.sh                   # 常驻 WebSub hub（本地绑 127.0.0.1:8667）
 ├── requirements.txt
 ├── deploy/
 │   └── com.localrss.refresh.plist   # launchd 定时任务模板（备选方案）
@@ -749,7 +1014,9 @@ local_rss/
 │   ├── config.py            # YAML 解析
 │   ├── models.py            # 统一的 Item 结构
 │   ├── store.py             # 状态与去重
-│   ├── feed.py              # RSS 2.0 生成
+│   ├── feed.py              # RSS 2.0 生成（含 rel="hub" 声明）
+│   ├── websub.py            # WebSub 发布端：内容更新后 ping hub
+│   ├── hub.py               # 自用的极简 WebSub hub（纯标准库）
 │   ├── cli.py               # 命令行逻辑
 │   └── providers/
 │       ├── __init__.py      # 注册表，自动发现同目录模块
@@ -757,7 +1024,7 @@ local_rss/
 │       ├── bilibili.py
 │       └── zhihu.py
 ├── output/                  # 生成的 RSS
-├── state/                   # 每个源一份 JSON，用于去重
+├── state/                   # 每个源一份 JSON（去重）+ hub.json（WebSub 订阅关系）
 └── logs/                    # pm2 / launchd / cron 的输出
 ```
 

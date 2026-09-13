@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import feed as feed_mod
 from . import providers
+from . import websub
 from .bridge import Bridge, BridgeError, check_bridge
 from .config import Config, load_config
 from .store import Store
@@ -17,7 +18,43 @@ from .store import Store
 DEFAULT_CONFIG = "config.yaml"
 
 
-def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> tuple[str, int, int, int]:
+def _feed_url(cfg: Config, feed_cfg) -> str:
+    """feed 的订阅地址 —— 阅读器订阅用它，WebSub 通知 hub 时也用同一个。"""
+    if cfg.base_url:
+        return f"{cfg.base_url}/{feed_cfg.filename}"
+    return feed_cfg.filename
+
+
+def _notify_hub(feed_cfg, cfg: Config) -> bool:
+    """ping 一次 hub，告诉它这个 feed 更新了。返回是否通知成功。
+
+    没配 hub 就什么都不做（返回 True，不算失败）。通知失败也**不影响**抓取结果，
+    只是打条日志 —— hub 挂了不该让整个定时任务算失败。
+    """
+    hub = feed_cfg.hub_url or cfg.hub_url
+    if not hub:
+        return True
+
+    url = _feed_url(cfg, feed_cfg)
+    if "://" not in url:
+        print(
+            f"[{feed_cfg.id}] WebSub 未通知：feed 地址不是完整 URL，"
+            "请在 config.yaml 的 output.base_url 里填订阅地址",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        code = websub.ping(hub, url)
+    except websub.WebSubError as e:
+        print(f"[{feed_cfg.id}] WebSub 通知失败：{e}", file=sys.stderr)
+        return False
+
+    print(f"[{feed_cfg.id}] 已通知 hub（HTTP {code}）：{url}")
+    return True
+
+
+def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dict:
     provider = providers.create(
         feed_cfg.type, feed_cfg.options, {"exclude_keywords": cfg.exclude_keywords}
     )
@@ -36,7 +73,9 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> tup
 
     # 过滤/去重/补全放在合并之后：改规则时存量条目也会被重新筛一遍
     visible = provider.postprocess(merged, bridge)
-    dropped = len(merged) - len(visible)
+    # 「过滤掉」只算真被规则丢掉的：被收进图片合集的条数不单条出现，但不是丢了信息
+    grouped = provider.grouped_items
+    dropped = len(merged) - len(visible) - grouped
 
     # postprocess 会就地补全条目（比如知乎全文），要把结果落盘，
     # 否则下次运行还得重抓一遍。注意存的是 merged（全量），不是 visible。
@@ -44,20 +83,27 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> tup
 
     output_path = cfg.output_dir / feed_cfg.filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    self_url = (
-        f"{cfg.base_url}/{feed_cfg.filename}" if cfg.base_url else feed_cfg.filename
-    )
+    # feed 的订阅地址：既是 RSS 里的 <atom:link rel="self">，也是 WebSub 通知 hub 的 topic
+    feed_url = _feed_url(cfg, feed_cfg)
     output_path.write_text(
         feed_mod.build_rss(
             title=feed_cfg.title,
             link=feed_cfg.site_url or provider.page_url(),
             description=feed_cfg.description,
             items=visible,
-            self_url=self_url,
+            self_url=feed_url,
+            hub_url=feed_cfg.hub_url or cfg.hub_url,
         ),
         encoding="utf-8",
     )
-    return str(output_path), len(visible), added, dropped
+    return {
+        "path": str(output_path),
+        "total": len(visible),
+        "added": added,
+        "dropped": dropped,
+        "grouped": grouped,
+        "derived": provider.derived_items,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,6 +129,11 @@ def main(argv: list[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="强制刷新：忽略本地缓存翻满 max_pages 重抓重渲（不清空 state）",
+    )
+    parser.add_argument(
+        "--ping",
+        action="store_true",
+        help="只 ping hub 通知这些源有更新，不抓取（不占用浏览器，用来验证 WebSub 链路）",
     )
     args = parser.parse_args(argv)
 
@@ -129,6 +180,25 @@ def main(argv: list[str] | None = None) -> int:
         print("没有需要处理的源。", file=sys.stderr)
         return 1
 
+    # --ping：只通知 hub，不抓取。不需要 WebBridge，所以放在创建 bridge 之前。
+    if args.ping:
+        if not any(f.hub_url or cfg.hub_url for f in feeds):
+            print(
+                "没有配置 hub（config.yaml 的 output.hub_url），无从通知。",
+                file=sys.stderr,
+            )
+            return 2
+        failed = 0
+        for feed_cfg in feeds:
+            output_path = cfg.output_dir / feed_cfg.filename
+            if not output_path.exists():
+                # feed 文件都没有，hub 抓过去只会 404，别白白发通知
+                print(f"[{feed_cfg.id}] 跳过：{output_path} 还不存在", file=sys.stderr)
+                continue
+            if not _notify_hub(feed_cfg, cfg):
+                failed += 1
+        return 1 if failed else 0
+
     bridge = Bridge(url=cfg.bridge_url, session=cfg.session)
     try:
         check_bridge(bridge)
@@ -142,11 +212,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for feed_cfg in feeds:
             try:
-                path, total, added, dropped = _run_feed(
-                    feed_cfg, cfg, bridge, force=args.force
-                )
-                suffix = f"，过滤掉 {dropped} 条" if dropped else ""
-                print(f"[{feed_cfg.id}] 新增 {added} 条，共 {total} 条{suffix} -> {path}")
+                r = _run_feed(feed_cfg, cfg, bridge, force=args.force)
+                notes = f"，过滤掉 {r['dropped']} 条" if r["dropped"] else ""
+                if r["grouped"]:
+                    notes += f"，{r['grouped']} 条并入合集"
+                print(f"[{feed_cfg.id}] 新增 {r['added']} 条，共 {r['total']} 条{notes} -> {r['path']}")
+                # 有新条目才通知 hub —— hub 收到就来抓 feed 并推给订阅者。
+                # 没有新内容那种常见运行就不打扰它了（通知失败不影响抓取结果）。
+                # derived：本轮没抓到新动态，但 postprocess 自己造了条目（比如攒够
+                # 或过期后兜底合成的图片合集），RSS 也确实变了，同样要通知。
+                if r["added"] or r["derived"]:
+                    _notify_hub(feed_cfg, cfg)
             except Exception as e:
                 failed += 1
                 print(f"[{feed_cfg.id}] 失败: {e}", file=sys.stderr)
