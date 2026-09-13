@@ -25,7 +25,8 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> tup
     print(f"[{feed_cfg.id}] 打开页面 {provider.page_url()}")
     provider.setup(bridge)
 
-    store = Store(cfg.state_dir / f"{feed_cfg.id}.json", history=cfg.history)
+    store = Store(cfg.state_dir / f"{feed_cfg.id}.json",
+                  history=feed_cfg.history or cfg.history)
     # --force：假装本地什么都没有，翻满 max_pages 重抓一遍。
     # 但仍然合并进原有 state（不是清空），所以知乎全文这类补全过的内容不会丢。
     known = set() if force else store.known_ids()

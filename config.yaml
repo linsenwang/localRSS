@@ -18,7 +18,9 @@ bridge:
 output:
   dir: output          # RSS 文件输出目录（相对本文件所在目录）
   state_dir: state     # 去重/增量用的状态目录
-  history: 300         # 每个源最多保留多少条
+  # 每个源最多保留多少条（默认值，可被各个 feed 的 history 覆盖）。
+  # 注意这是「条数」上限，不按体积算：带全文的源每条体积大得多，所以单独调小了。
+  history: 150
   # 订阅服务的地址前缀（由 pm2 里的 local-rss-http 提供，端口见 ecosystem.config.js）。
   # 用于 RSS 里的 <atom:link rel="self">。
   base_url: http://127.0.0.1:8666
@@ -56,6 +58,7 @@ feeds:
     description: t.bilibili.com 关注动态
     site_url: https://t.bilibili.com/
     enabled: true
+    history: 150         # 纯文本 + 封面，每条约 1.6 KB；满 150 条约 240 KB
     options:
       mode: feed       # feed = 关注动态；space = 指定 UP 主
       max_pages: 3     # 每页约 20 条，抓满 max_pages 或遇到已有记录就停
@@ -65,31 +68,55 @@ feeds:
       filter_image_only: true
       # 在每条正文开头放 UP 主头像（RSS 没有「每条一个图标」的字段，只能这样带出来）
       show_avatar: false
-      # 视频动态内嵌 B 站官方播放器（<iframe>），可以直接在阅读器里播。
+      # 视频动态内嵌 B 站播放器（<iframe>）。实测能用的排前面：
       #   mobile      移动版 html5mobileplayer —— 喂渐进式 mp4，iOS 能播；
-      #               但它在 <video> 上写死了 playsinline，iOS 拿不到原生全屏（全屏会黑屏）
-      #   html5player blackboard/html5player —— 走 MSE，不带 playsinline，测试中
-      #   desktop     player.bilibili.com 外链播放器（MSE）
-      #   newplayer   blackboard/player（我测的卡在初始化出不来，留作对照）
+      #               但在 <video> 上写死了 playsinline，iOS 拿不到原生全屏
+      #   html5player blackboard/html5player（当前）—— 不带 playsinline，
+      #               加载快，双击可进 iOS 原生全屏且不黑屏
+      #   desktop     官方外链 player.bilibili.com —— MSE，实测手机上出不来
+      #   newplayer   blackboard/player —— 卡在「播放器初始化」，出不来
       #   false       关闭，只留标题链接 + 封面图
-      embed_player: mobile
+      embed_player: html5player
 
   # ---- 知乎个人动态 ----
+  #
+  # 新增一个知乎源只要 id / title / site_url / options.token 四项，其余全部用
+  # 下面这些代码里的默认值，不用再抄一遍；需要改哪个，就在该源的 options 下写同名键。
+  #   max_pages: 5              最多翻几页
+  #   dedupe_by_content: true   正文相同的只保留一条（同一条回答会以「回答了问题」+「收藏了回答」出现两次）
+  #   fulltext: true            抓全文（导航到内容页从 DOM 取正文）。每条只抓一次，存在 state 里。
+  #   max_fulltext_per_run: 10  每次运行最多补几篇全文（首次启用时历史条目分批补齐，避免单次跑太久）
+  #   list_retries: 2           平台偶发风控（返回「请求参数异常，请升级客户端后重试。」）时的短重试次数
+  #   list_retry_delay_s: 15    每次重试之间的间隔秒数，不用白等下一个 30 分钟周期
   - id: zhihu-kvxjr369f
     type: zhihu
     title: kvxjr369f
     description: 知乎个人主页动态
     site_url: https://www.zhihu.com/people/kvxjr369f
     enabled: true
+    history: 60          # 带全文，每条约 6.6 KB；满 60 条约 400 KB（150 条要 1 MB）
     options:
       token: kvxjr369f
-      max_pages: 5
-      # 正文相同的只保留一条（同一条回答会以「回答了问题」+「收藏了回答」出现两次）
-      dedupe_by_content: true
-      # 抓全文（导航到内容页从 DOM 取正文）。每条只抓一次，存在 state 里。
-      fulltext: true
-      # 每次运行最多补几篇全文（首次启用时历史条目分批补齐，避免单次跑太久）
-      max_fulltext_per_run: 10
+
+  - id: zhihu-nell
+    type: zhihu
+    title: nell
+    description: 知乎个人主页动态
+    site_url: https://www.zhihu.com/people/nell
+    enabled: true
+    history: 60          # 同上，带全文，别用全局默认的 150
+    options:
+      token: nell
+
+  - id: zhihu-GalAster
+    type: zhihu
+    title: GalAster
+    description: 知乎个人主页动态
+    site_url: https://www.zhihu.com/people/GalAster
+    enabled: true
+    history: 60          # 同上，带全文，别用全局默认的 150
+    options:
+      token: GalAster
 
   # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
   # - id: bilibili-up

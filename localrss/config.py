@@ -19,6 +19,7 @@ class FeedConfig:
     site_url: str = ""
     file: str = ""
     enabled: bool = True
+    history: int | None = None  # 覆盖 output.history；None 表示用全局默认
     options: dict = field(default_factory=dict)
 
     @property
@@ -86,6 +87,7 @@ def load_config(path: str | Path) -> Config:
                 site_url=entry.get("site_url") or "",
                 file=entry.get("file") or "",
                 enabled=bool(entry.get("enabled", True)),
+                history=int(entry["history"]) if entry.get("history") else None,
                 options=dict(entry.get("options") or {}),
             )
         )

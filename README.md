@@ -316,6 +316,21 @@ pm2 delete local-rss local-rss-http
 如果这台机器还没配过 pm2 的开机自启，跑一次 `pm2 startup` 并按它给出的提示执行
 （会写一个 launchd agent，让登录时自动 `pm2 resurrect`），然后再 `pm2 save`。
 
+> ⚠️ **macOS 13+ 还有一道系统设置要过。** `pm2 startup` 只是写了个 plist，
+> 系统仍可能把它标成 `disallowed`，那样登录时根本不会执行。查一下：
+>
+> ```bash
+> sfltool dumpbtm | grep -B6 -A6 "com.PM2"
+> #   Disposition: [enabled, allowed, ...]      ← 正常
+> #   Disposition: [enabled, disallowed, ...]   ← 被挡住了，登录不会跑
+> ```
+>
+> 是 `disallowed` 就去 **系统设置 → 通用 → 登录项 → 允许在后台**，
+> 找到对应的条目（pm2 这个会显示成 `sh`，因为 `Executable Path` 是 `/bin/sh`）打开开关。
+> `sfltool` 没有改单项的 CLI，只有 `resetbtm` 全量重置（会清掉所有后台项授权，别用）。
+>
+> 注意这影响的是**整个 pm2 daemon**：`com.PM2` 不跑，里面所有应用重启后都不会自己起来。
+
 改间隔：编辑 `ecosystem.config.js` 里的 `cron_restart`，然后
 
 ```bash
@@ -337,9 +352,17 @@ pm2 save
 
 ```bash
 cp deploy/com.localrss.refresh.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.localrss.refresh.plist
-launchctl start com.localrss.refresh    # 立刻跑一次
+# bootstrap 是现在的推荐做法；launchctl load 是遗留子命令
+# （launchctl help 里它自己写着 "Recommended alternatives: bootstrap | enable"）
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.localrss.refresh.plist
+launchctl kickstart -k gui/$(id -u)/com.localrss.refresh   # 立刻跑一次
 ```
+
+> 别用 `launchctl list | grep <label>` 判断有没有加载成功。
+> 带 `LaunchOnlyOnce` 的作业（`pm2 startup` 生成的就是）跑完会被 launchd 立刻从 domain 移除，
+> 日志里就是这样三步：`Setting service ... to enabled` → `service inactive` → `removing service`。
+> 所以 `list`/`print` 查不到是正常的，**不代表失败**。
+> 想确认它到底跑没跑，看它产生的输出（日志文件有没有增长）最靠谱。
 
 cron 版本：
 
@@ -370,7 +393,7 @@ bridge:
 output:
   dir: output        # RSS 输出目录（相对 config.yaml 所在目录）
   state_dir: state   # 去重/增量用的状态目录
-  history: 300       # 每个源最多保留多少条
+  history: 150       # 每个源最多保留多少条（可被各 feed 的 history 覆盖）
   base_url: ""       # 可选，服务地址前缀
 
 # 全局关键词过滤：标题或正文命中任一关键词的条目会被丢掉。
@@ -388,6 +411,7 @@ feeds:
     site_url: https://t.bilibili.com/   # RSS channel link
     file: bilibili-follow.xml  # 可选，自定义输出文件名
     enabled: true              # 可选，false 则跳过
+    history: 150               # 可选，覆盖 output.history（按源单独设上限）
     options:                   # provider 各自的参数
       mode: feed
       max_pages: 3
@@ -404,7 +428,7 @@ feeds:
 | `filter_self_repost` | `true` | 过滤掉「转发自 @自己」的回环转发 |
 | `filter_image_only` | `true` | 过滤掉纯图动态（只有图片、没有正文的） |
 | `show_avatar` | `true` | 在每条正文开头放 UP 主头像（改开关立即生效） |
-| `embed_player` | `mobile` | 视频内嵌播放器：`mobile` / `html5player` / `desktop` / `newplayer` / `false`（改开关立即生效） |
+| `embed_player` | `html5player` | 视频内嵌播放器：`mobile` / `html5player` / `desktop` / `newplayer` / `false`（改开关立即生效） |
 
 ### bilibili 的标题格式
 
@@ -448,39 +472,42 @@ q9adg 房车博主大批消失，床车自驾爆火，二者差距到底有多�
 | `dedupe_by_content` | `true` | 正文相同的只保留一条 |
 | `fulltext` | `true` | 导航到内容页抓全文 |
 | `max_fulltext_per_run` | `10` | 每次运行最多补几篇全文 |
+| `list_retries` | `2` | 列表接口偶发风控时的重试次数 |
+| `list_retry_delay_s` | `15` | 每次重试之间的等待秒数 |
 
 ### bilibili · `embed_player`
 
 视频动态内嵌 B 站官方播放器，可以在阅读器里直接播：
 
 ```yaml
-embed_player: mobile    # mobile | html5player | desktop | newplayer | false
+embed_player: html5player   # mobile | html5player | desktop | newplayer | false
 ```
 
 | 值 | 播放页 | 视频源 | 实际结果 |
 |----|--------|--------|----------|
-| `mobile` | `blackboard/html5mobileplayer.html` | **渐进 mp4** | ✅ 手机能播；✗ 无原生全屏（写死 `playsinline`） |
-| `desktop` | `player.bilibili.com/player.html` | MSE | Mac 上能播，iPhone 上卡住 |
-| `html5player` | `blackboard/html5player.html` | MSE | 桌面浏览器能加载（readyState 4），iPhone 上不行 |
-| `newplayer` | `blackboard/player.html` | MSE | 卡在初始化，出不来 |
+| **`html5player`** | `blackboard/html5player.html` | MSE | **当前采用**。不带 `playsinline`，加载快、手机上能出来，双击可进 iOS 原生全屏且不黑屏 |
+| `mobile` | `blackboard/html5mobileplayer.html` | 渐进 mp4 | 能播；但写死 `playsinline`，iOS 拿不到原生全屏（全屏会黑屏） |
+| `desktop` | `player.bilibili.com/player.html` | MSE | 官方外链播放器，实测手机上出不来 |
+| `newplayer` | `blackboard/player.html` | MSE | 卡在「播放器初始化」，出不来 |
 | `false` | — | — | 不嵌播放器，靠正文里的视频标题链接 |
 
 `desktop` 严格按[官方外链播放器文档](https://player.bilibili.com/player.html)的参数来
-（只用文档列出的 `bvid` / `p` / `autoplay` / `danmaku` / `poster`）。
+（只用文档列出的 `bvid` / `p` / `autoplay` / `danmaku` / `poster`）；`html5player` 没有官方文档，
+用的是 `bvid` / `page` / `as_wide` / `high_quality` / `danmaku`。
 
-> **为什么无解**：iOS 的规则是 `<video>` 一旦带 `playsinline`，就不再暴露
-> `webkitEnterFullscreen`（原生全屏的唯一入口）。而 B 站**移动版**播放器在 `mplayer.js` 里
-> **无条件写死**了 `setAttribute("playsinline","")` —— 这正是它能在 iOS 上播的原因，
-> 也是它拿不到原生全屏的原因。
+> **选型依据（实测，不是在猜）**：
 >
-> 不带 `playsinline` 的那几个（`desktop` / `html5player` / `newplayer`）**全部走 MSE**
-> （`<video>` 的 `src` 是 `blob:`），而 iPhone 的 WebView 对 MSE 支持很晚且不完整
-> （iOS 17.1 才引入 `ManagedMediaSource`），实测两个 MSE 播放器在手机上都是黑框/卡住。
+> - `desktop` 和 `html5player` **都走 MSE**（`<video>` 的 `src` 是 `blob:`），也**都不带 `playsinline`**，
+>   理论上都能拿到 iOS 原生全屏。但两者是**不同的播放器实现**，实机上只有 `html5player` 出得来
+>   （`desktop` 停在 `readyState: 0`，页面上一个字都没有）。
+> - `mobile` 能播（喂渐进式 mp4），但它在 `mplayer.js` 里**无条件写死**了
+>   `setAttribute("playsinline","")`，iOS 因此不暴露 `webkitEnterFullscreen`（原生全屏的唯一入口），
+>   只能用 DOM 的 `requestFullscreen()` 自己做全屏 —— WKWebView 对这种 DOM 全屏支持很差，
+>   退出时留下黑色图层，就是之前那个黑屏。
+> - 自己渲染 `<video>` 绕过 iframe 行不通：直链（`upos-*.bilivideo.com/...mp4`）对任何 Referer
+>   都返回 403（要播放器的 cookie 上下文），且 `deadline` 只有 2 小时。
 >
-> 想自己渲染 `<video>` 绕过 iframe 也不行：直链（`upos-*.bilivideo.com/...mp4`）
-> 对任何 Referer 都返回 **403**（要播放器的 cookie 上下文），而且 `deadline` 只有 2 小时。
->
-> 一句话：**能播的那个恰好就是没全屏的那个**，这是 B 站播放器写死的取舍，外部改不了。
+> 切换只需改 `embed_player` 一行，改完立即生效。
 
 转发动态里带的视频也会嵌（递归处理）。实测 34 条里 32 条带上播放器。
 
@@ -603,6 +630,42 @@ exclude_keywords:
 顺带修了个隐性问题：接口给的图片地址有 `http://` 的（`face`、视频封面都是），
 阅读器页面多半是 https，浏览器会把 http 图片当**混合内容**拦掉。
 现在所有图片 URL 统一升级成 https（实测 `i0/i1/i2.hdslb.com` 都支持 https，返回 200 image/jpeg）。
+
+### 保留条数（`history`）
+
+`output.history` 是**全局默认**，每个 feed 可以用自己的 `history` 覆盖。
+两者都是「条数」上限，不按体积算 —— 而带全文的源每条体积大得多，所以单独调小：
+
+```yaml
+output:
+  history: 150      # 默认
+feeds:
+  - id: bilibili-follow
+    history: 150    # 纯文本 + 封面，每条约 1.6 KB，满 150 条约 240 KB
+  - id: zhihu-kvxjr369f
+    history: 60     # 带全文，每条约 6.6 KB，满 60 条约 400 KB（150 条要 1 MB）
+```
+
+超过上限时按时间从旧到新裁掉。调小之后下一次运行就会立刻生效（`merge` 时切片）。
+
+### zhihu 的列表重试
+
+平台偶发风控时会返回 `请求参数异常，请升级客户端后重试。`，
+以前只能等下一个 30 分钟的周期，现在会就地重试：
+
+```yaml
+    options:
+      list_retries: 2          # 额外重试次数（总共 3 次尝试）
+      list_retry_delay_s: 15   # 每次之间等 15 秒
+```
+
+重试会打日志：
+
+```
+[重试] 知乎动态第 1 页 第 1/2 次失败：知乎接口返回异常（第 1 页）: 请求参数异常，请升级客户端后重试。，15s 后重来
+```
+
+实现在 `localrss/providers/base.py` 的 `retry_call()`，其他 provider 也可以直接用。
 
 ### zhihu · `dedupe_by_content`
 

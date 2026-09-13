@@ -8,9 +8,29 @@ from __future__ import annotations
 
 import html
 import re
+import sys
+import time
 
 from ..bridge import Bridge
 from ..models import Item
+
+
+def retry_call(fn, attempts: int = 3, delay_s: float = 15.0, label: str = ""):
+    """重试 fn()，最后一次仍失败就把异常抛出去。
+
+    用于平台偶发的风控响应（知乎会返回「请求参数异常，请升级客户端后重试。」），
+    这种通常等十几秒就自己好了，不值得白等下一个 30 分钟的周期。
+    """
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if i >= attempts:
+                raise
+            print(f"    [重试] {label} 第 {i}/{attempts - 1} 次失败：{e}"
+                  f"，{delay_s:.0f}s 后重来", file=sys.stderr)
+            if delay_s:
+                time.sleep(delay_s)
 
 
 class Provider:

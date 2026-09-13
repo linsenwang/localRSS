@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from ..bridge import Bridge
 from ..models import Item, sort_key
 from . import register
-from .base import Provider
+from .base import Provider, retry_call
 
 API = "https://www.zhihu.com/api/v3/moments/{token}/activities"
 PROFILE = "https://www.zhihu.com/people/{token}"
@@ -257,12 +257,14 @@ class ZhihuProvider(Provider):
         max_pages = int(self.opt("max_pages", 5))
         url = API.format(token=self.require("token")) + "?offset=0&page_num=1"
         items: list[Item] = []
+        attempts = int(self.opt("list_retries", 2)) + 1
+        delay_s = float(self.opt("list_retry_delay_s", 15))
 
         for page in range(1, max_pages + 1):
-            result = bridge.evaluate(EXTRACT_JS.replace("__URL__", url))
-            if not result or not result.get("ok"):
-                detail = (result or {}).get("error") or result
-                raise RuntimeError(f"知乎接口返回异常（第 {page} 页）: {detail}")
+            result = retry_call(
+                lambda u=url, p=page: self._fetch_page(bridge, u, p),
+                attempts=attempts, delay_s=delay_s, label=f"知乎动态第 {page} 页",
+            )
 
             raw_items = result.get("items") or []
             if not raw_items:
@@ -278,6 +280,14 @@ class ZhihuProvider(Provider):
             url = result["next"]
 
         return items
+
+    def _fetch_page(self, bridge: Bridge, url: str, page: int) -> dict:
+        """抓一页动态列表。失败抛异常，由 retry_call 决定要不要重来。"""
+        result = bridge.evaluate(EXTRACT_JS.replace("__URL__", url))
+        if not result or not result.get("ok"):
+            detail = (result or {}).get("error") or result
+            raise RuntimeError(f"知乎接口返回异常（第 {page} 页）: {detail}")
+        return result
 
     def _to_item(self, o: dict) -> Item:
         created = int(o.get("created") or 0)
