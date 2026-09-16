@@ -18,6 +18,12 @@ bridge:
 output:
   dir: output          # RSS 文件输出目录（相对本文件所在目录）
   state_dir: state     # 去重/增量用的状态目录
+  log_dir: logs        # 过滤清单的目录（见下面的 dropped_log）
+  # 把每轮「过滤掉的条目 + 丢它的原因」写成 <log_dir>/<feed-id>.dropped.log。
+  # **每次运行覆盖写**（不是追加）：只保留最近一轮的清单，所以文件很小，
+  # 用来回头核对关键词规则有没有误伤。没有过滤掉的条目时也会写一个空清单，
+  # 免得上一轮的内容留在文件里冒充本轮。
+  dropped_log: true
   # 每个源最多保留多少条（默认值，可被各个 feed 的 history 覆盖）。
   # 注意这是「条数」上限，不按体积算：带全文的源每条体积大得多，所以单独调小了。
   history: 150
@@ -74,13 +80,13 @@ feeds:
       mode: feed       # feed = 关注动态；space = 指定 UP 主
       max_pages: 3     # 每页约 20 条，抓满 max_pages 或遇到已有记录就停
       # 过滤掉「转发自 @自己」的回环转发（转发的原动态就是本人发的）
-      filter_self_repost: true
+      filter_self_repost: false
       # 「图片动态」（DYNAMIC_TYPE_DRAW，带不带正文都算）和「转发」
       # （DYNAMIC_TYPE_FORWARD）单发一条太吵 —— 实测两天 41 + 14 条。
       # 攒够 image_digest_size 条就合成一条合集再进 RSS，内容一条不落
       # （作者/时间/正文/图片/链接都在，转发里的视频播放器也照样嵌）。
       # 设成 0 则关掉合集，退回下面的老行为。详见 README 的「动态合集」。
-      image_digest_size: 10
+      image_digest_size: 5
       # 攒不满 image_digest_size 时的兜底：最旧的那条超过这个小时数就照样合成一条，
       # 免得冷清的时候几条内容一直不出现在 RSS 里。设成 0 = 不兜底（一直攒着）。
       image_digest_max_age_hours: 24
@@ -105,6 +111,10 @@ feeds:
   # 下面这些代码里的默认值，不用再抄一遍；需要改哪个，就在该源的 options 下写同名键。
   #   max_pages: 5              最多翻几页
   #   dedupe_by_content: true   正文相同的只保留一条（同一条回答会以「回答了问题」+「收藏了回答」出现两次）
+  #   dedupe_memory_days: 45    去重指纹记多久。指纹单独存在 state 里、不跟条目一起裁：
+  #                             条目被 history 挤出去之后，同一条正文再被别的动作
+  #                             （收藏/赞同/换标题重抓）带出来时，仍然认得出来、不会再发一遍。
+  #                             0 = 只比窗口内的条目（老行为，会看到旧文章被重发一次）。
   #   fulltext: true            抓全文（导航到内容页从 DOM 取正文）。每条只抓一次，存在 state 里。
   #   max_fulltext_per_run: 10  每次运行最多补几篇全文（首次启用时历史条目分批补齐，避免单次跑太久）
   #   list_retries: 2           平台偶发风控（返回「请求参数异常，请升级客户端后重试。」）时的短重试次数
@@ -116,6 +126,10 @@ feeds:
     site_url: https://www.zhihu.com/people/kvxjr369f
     enabled: true
     history: 60          # 带全文，每条约 6.6 KB；满 60 条约 400 KB（150 条要 1 MB）
+    # 只对这个源生效的关键词过滤，叠加在顶层 exclude_keywords 之上
+    exclude_keywords:
+      - 关于每天的早安行动
+      - 关于素问每日晚间抢答对战
     options:
       token: kvxjr369f
 

@@ -6,6 +6,7 @@ import argparse
 import signal
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from . import feed as feed_mod
@@ -54,9 +55,41 @@ def _notify_hub(feed_cfg, cfg: Config) -> bool:
     return True
 
 
+def _write_dropped_log(
+    log_path: Path,
+    feed_cfg,
+    total: int,
+    visible: int,
+    records: list[tuple],
+) -> None:
+    """把本轮被过滤掉的条目写成一份清单，**覆盖**上一轮的（不追加）。
+
+    每次运行都写，哪怕一条没丢 —— 否则上一轮的内容会一直留在文件里冒充本轮结果。
+    条目是按「原因 | 时间 | 标题 | 链接」一行一条，方便 grep 和 diff。
+    """
+    lines = [
+        f"# 过滤清单：每次运行覆盖写（生成于 {datetime.now():%Y-%m-%d %H:%M:%S}）",
+        f"# feed = {feed_cfg.id} ({feed_cfg.type})  "
+        f"本轮 {total} 条 → 可见 {visible} 条，过滤掉 {len(records)} 条",
+        "# 原因 | 时间 | 标题 | 链接",
+    ]
+    for item, reason in records:
+        when = item.published.strftime("%Y-%m-%d %H:%M") if item.published else "-"
+        title = " ".join((item.title or "").split()) or "(无标题)"
+        lines.append(f"{reason} | {when} | {title} | {item.link or '-'}")
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dict:
     provider = providers.create(
-        feed_cfg.type, feed_cfg.options, {"exclude_keywords": cfg.exclude_keywords}
+        feed_cfg.type,
+        feed_cfg.options,
+        {
+            # 全局关键词 + 该源自己的关键词（feed 级的只影响这个源）
+            "exclude_keywords": cfg.exclude_keywords + feed_cfg.exclude_keywords,
+        },
     )
 
     print(f"[{feed_cfg.id}] 打开页面 {provider.page_url()}")
@@ -71,11 +104,31 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
     items = provider.fetch(bridge, known)
     merged, added = store.merge(items)
 
+    # 跨窗口的去重指纹：窗口内的对比靠条目本身，窗口外的靠这份表
+    # （条目会被 history 裁掉，表不会 —— 见 providers/zhihu.py 的 _dedupe_by_content）
+    provider.seen_content = store.seen_content()
     # 过滤/去重/补全放在合并之后：改规则时存量条目也会被重新筛一遍
     visible = provider.postprocess(merged, bridge)
+    # provider 填了新表才覆盖（None = 这个 provider 不玩跨窗口去重）
+    if provider.published_content is not None:
+        store.set_seen_content(provider.published_content)
     # 「过滤掉」只算真被规则丢掉的：被收进图片合集的条数不单条出现，但不是丢了信息
     grouped = provider.grouped_items
     dropped = len(merged) - len(visible) - grouped
+
+    # 过滤清单：丢了哪些、为什么丢，写一份到 logs/<id>.dropped.log（覆盖写）。
+    # 这份文件只为人看，跟 RSS/state 无关，失败也不该让整轮算失败。
+    dropped_log_path = ""
+    if cfg.dropped_log:
+        dropped_log_path = str(cfg.log_dir / f"{feed_cfg.id}.dropped.log")
+        try:
+            _write_dropped_log(
+                Path(dropped_log_path), feed_cfg, len(merged), len(visible),
+                provider.dropped_items,
+            )
+        except OSError as e:
+            dropped_log_path = ""
+            print(f"[{feed_cfg.id}] 过滤清单写入失败：{e}", file=sys.stderr)
 
     # postprocess 会就地补全条目（比如知乎全文），要把结果落盘，
     # 否则下次运行还得重抓一遍。注意存的是 merged（全量），不是 visible。
@@ -103,6 +156,7 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
         "dropped": dropped,
         "grouped": grouped,
         "derived": provider.derived_items,
+        "dropped_log": dropped_log_path,
     }
 
 
@@ -217,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
                 if r["grouped"]:
                     notes += f"，{r['grouped']} 条并入合集"
                 print(f"[{feed_cfg.id}] 新增 {r['added']} 条，共 {r['total']} 条{notes} -> {r['path']}")
+                if r["dropped_log"] and r["dropped"]:
+                    print(f"[{feed_cfg.id}] 过滤清单（覆盖写）-> {r['dropped_log']}")
                 # 有新条目才通知 hub —— hub 收到就来抓 feed 并推给订阅者。
                 # 没有新内容那种常见运行就不打扰它了（通知失败不影响抓取结果）。
                 # derived：本轮没抓到新动态，但 postprocess 自己造了条目（比如攒够

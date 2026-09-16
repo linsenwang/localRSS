@@ -49,10 +49,35 @@ class Provider:
         #: 被 postprocess 收进合集的条目数（不是被过滤掉，只是不单条出现）。
         #: cli 用它把「过滤掉 N 条」和「合并进合集」分开报，免得看起来像丢了信息。
         self.grouped_items = 0
+        #: 被 postprocess 真丢掉的条目：(条目, 原因)。
+        #: cli 拿它写「过滤清单」日志（见 config.yaml 的 output.dropped_log），
+        #: 用来回头核对规则是不是误伤 —— 光看「过滤掉 N 条」看不出丢的是哪些。
+        self.dropped_items: list[tuple[Item, str]] = []
+        #: 跨窗口的正文指纹表 {指纹: 首次发布时间 ISO}，postprocess 之前由 cli
+        #: 从 state 里读出来塞进来。这份表不跟着 history 一起裁，所以「这条正文
+        #: 已经发出去过」不会随着条目滚出窗口就忘掉（见 zhihu.py 的 _dedupe_by_content）。
+        self.seen_content: dict[str, str] = {}
+        #: 本轮过后「已经发出去过」的指纹表，由用它的 provider 填写；
+        #: None = 这个 provider 不用跨窗口去重，cli 就不会覆盖 state 里那份。
+        self.published_content: dict[str, str] | None = None
 
     def opt(self, key: str, default=None):
         value = self.options.get(key)
         return default if value is None else value
+
+    def note_drop(self, item: Item, reason: str) -> None:
+        """记下一条被丢掉的条目，以及丢它的原因（写过滤清单日志用）。"""
+        self.dropped_items.append((item, reason))
+
+    def drop_unless(self, items: list[Item], keep, reason: str) -> list[Item]:
+        """只保留 keep(item) 为真的条目，其余按 reason 记进 dropped_items。"""
+        kept: list[Item] = []
+        for item in items:
+            if keep(item):
+                kept.append(item)
+            else:
+                self.note_drop(item, reason)
+        return kept
 
     def require(self, key: str):
         value = self.options.get(key)
@@ -91,7 +116,11 @@ class Provider:
         这里实现的是所有站点通用的关键词过滤；子类覆盖本方法时
         请先调用 super().postprocess(items, bridge) 再叠加自己的规则。
         """
-        return exclude_by_keywords(items, self.common.get("exclude_keywords"))
+        return exclude_by_keywords(
+            items,
+            self.common.get("exclude_keywords"),
+            on_drop=self.note_drop,
+        )
 
 
 def plain_text(item: Item) -> str:
@@ -100,9 +129,26 @@ def plain_text(item: Item) -> str:
     return html.unescape(re.sub(r"<[^>]+>", " ", raw))
 
 
-def exclude_by_keywords(items: list[Item], keywords) -> list[Item]:
-    """丢掉标题或正文命中任一关键词的条目（大小写不敏感的子串匹配）。"""
-    words = [str(k).strip().lower() for k in (keywords or []) if str(k).strip()]
+def exclude_by_keywords(items: list[Item], keywords, on_drop=None) -> list[Item]:
+    """丢掉标题或正文命中任一关键词的条目（大小写不敏感的子串匹配）。
+
+    on_drop(item, reason) 每丢一条调一次，reason 里带上命中的那个关键词
+    （用配置里原本的大小写），给过滤清单日志用。
+    """
+    words = [
+        (str(k).strip().lower(), str(k).strip())
+        for k in (keywords or [])
+        if str(k).strip()
+    ]
     if not words:
         return items
-    return [i for i in items if not any(w in plain_text(i).lower() for w in words)]
+
+    kept: list[Item] = []
+    for item in items:
+        text = plain_text(item).lower()
+        hit = next((orig for low, orig in words if low in text), None)
+        if hit is None:
+            kept.append(item)
+        elif on_drop is not None:
+            on_drop(item, f"关键词「{hit}」")
+    return kept

@@ -13,7 +13,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
 from ..bridge import Bridge
@@ -127,11 +127,35 @@ FULLTEXT_SELECTORS: dict[str, tuple[list[str], list[str]]] = {
             ".ContentItem .RichText",
         ],
     ),
+    # 「添加了问题」这类动态指向的是问题页：正文就是问题描述（补充说明）。
+    # 它在 .QuestionRichText 里，折叠时只给半截 + 「显示全部」按钮（展开由
+    # _extract_js 负责）。问题可以没有描述，那时页面上没这个节点，见
+    # OPTIONAL_CONTENT_TYPES。
+    "question": (
+        ["h1.QuestionHeader-title"],
+        [
+            ".QuestionRichText span[itemprop='text']",
+            ".QuestionRichText .RichText",
+            ".QuestionRichText",
+        ],
+    ),
 }
+
+#: 这些类型「页面上没有正文」是正常情况（问题可以没有描述），不算抓取失败。
+OPTIONAL_CONTENT_TYPES = {"question"}
 
 PAGE_WAIT_MS = 3000      # 导航后等页面渲染
 ITEM_DELAY_MS = 3000     # 两次抓取之间的间隔（再叠随机抖动）
 MIN_CONTENT_LEN = 50
+
+# 正文的等待策略。长回答是**分阶段**渲染的：页面先给一小段（约 2 KB HTML，
+# 几百字），随后整篇才替换进来 —— 固定等 3 秒会稳定地抓到那个半截版本，
+# 并且因为 extra.fulltext 只抓一次，半截版会被永久锁进 state（实测踩过）。
+# 所以在页面里轮询，等内容长度稳定下来再取；顺手点掉「阅读全文」。
+CONTENT_POLL_MS = 400        # 轮询间隔
+CONTENT_MIN_WAIT_MS = 3000   # 至少等这么久（内容一直稳定也不会更早返回）
+CONTENT_STABLE_MS = 1500     # 长度连续这么久没变才算渲染完
+CONTENT_MAX_WAIT_MS = 20000  # 上限，别把一次抓取拖太久
 
 
 def _extract_js(title_selectors: list[str], content_selectors: list[str]) -> str:
@@ -139,29 +163,95 @@ def _extract_js(title_selectors: list[str], content_selectors: list[str]) -> str
     titles = json.dumps(list(title_selectors))
     contents = json.dumps(list(content_selectors))
     return f"""
-    (() => {{
+    (async () => {{
         const titleSelectors = {titles};
         const contentSelectors = {contents};
         const minLen = {MIN_CONTENT_LEN};
+        const pollMs = {CONTENT_POLL_MS};
+        const minWaitMs = {CONTENT_MIN_WAIT_MS};
+        const stableMs = {CONTENT_STABLE_MS};
+        const maxWaitMs = {CONTENT_MAX_WAIT_MS};
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-        let title = document.title;
-        for (const sel of titleSelectors) {{
-            const el = document.querySelector(sel);
-            if (el && el.innerText.trim()) {{ title = el.innerText.trim(); break; }}
-        }}
-
-        let contentHtml = '';
-        let hasContent = false;
-        for (const sel of contentSelectors) {{
-            const el = document.querySelector(sel);
-            if (el && el.innerHTML.length > minLen) {{
-                contentHtml = el.innerHTML;
-                hasContent = true;
-                break;
+        function pick() {{
+            let title = document.title;
+            for (const sel of titleSelectors) {{
+                const el = document.querySelector(sel);
+                if (el && el.innerText.trim()) {{ title = el.innerText.trim(); break; }}
             }}
+
+            let node = null;
+            let contentHtml = '';
+            for (const sel of contentSelectors) {{
+                const el = document.querySelector(sel);
+                if (el && el.innerHTML.length > minLen) {{
+                    node = el;
+                    contentHtml = el.innerHTML;
+                    break;
+                }}
+            }}
+            return {{ title, content: contentHtml, hasContent: !!node, node }};
         }}
 
-        return {{ title, content: contentHtml, hasContent }};
+        // 折叠的正文（只剩前半段 + 按钮）：点一下让剩下的渲染出来。
+        // 回答/文章是「阅读全文」，问题描述是「显示全部」。
+        // 只在按钮文字匹配时点，已经展开时按钮就没了，不会误触。
+        function expandCollapsed(node) {{
+            if (!node) return false;
+            const scope = node.closest(
+                '.QuestionRichText, .AnswerCard, .AnswerItem, .ContentItem') || document;
+            const btns = scope.querySelectorAll(
+                '.ContentItem-expandButton, .ContentItem-more button, .QuestionRichText-more');
+            for (const btn of btns) {{
+                const text = (btn.innerText || '').trim();
+                if (text.indexOf('阅读全文') === -1 && text.indexOf('展开') === -1
+                    && text.indexOf('显示全部') === -1) continue;
+                btn.click();
+                return true;
+            }}
+            return false;
+        }}
+
+        const started = Date.now();
+        let best = pick();
+        let expanded = false;
+        let lastLen = -1;
+        let stableSince = started;
+
+        while (true) {{
+            const cur = pick();
+            // 留最长的那次结果：万一展开反而让 DOM 变短，也不会把正文弄丢
+            if (cur.content.length > best.content.length) best = cur;
+
+            if (cur.content.length !== lastLen) {{
+                lastLen = cur.content.length;
+                stableSince = Date.now();
+            }}
+
+            if (!expanded && expandCollapsed(cur.node)) {{
+                expanded = true;
+                lastLen = -1;
+                await sleep(pollMs);
+                continue;
+            }}
+
+            const elapsed = Date.now() - started;
+            if (elapsed >= maxWaitMs) break;
+            // 一直取不到正文（被风控/页面异常）不用耗到上限；取到了则要等它稳定
+            if (elapsed >= minWaitMs
+                && (!best.hasContent || Date.now() - stableSince >= stableMs)) break;
+            await sleep(pollMs);
+        }}
+
+        // collapsed 是给调用方的一道保险：万一「显示全部」没点上，取到的就是
+        // 半截正文（还带个「…」），那种宁可报失败重来，也别锁进 state。
+        const last = pick();
+        return {{
+            title: best.title,
+            content: best.content,
+            hasContent: best.hasContent,
+            collapsed: !!(last.node && last.node.closest('.QuestionRichText--collapsed')),
+        }};
     }})()
     """
 
@@ -178,11 +268,53 @@ def _same_page(final_url: str, expected_url: str) -> bool:
 
 
 def _id_from_link(link: str) -> str:
-    for pattern in (r"/answer/(\d+)", r"zhuanlan\.zhihu\.com/p/(\d+)", r"/pin/(\d+)"):
+    """从条目链接里取内容 id。
+
+    顺序要紧：回答的链接长的就是 `question/<qid>/answer/<aid>`，得先匹配 answer，
+    否则会取成问题 id。`/questions?/` 兼顾 `api.zhihu.com/questions/<id>` 这种接口地址。
+    """
+    for pattern in (
+        r"/answer/(\d+)",
+        r"zhuanlan\.zhihu\.com/p/(\d+)",
+        r"/pin/(\d+)",
+        r"/questions?/(\d+)",
+    ):
         m = re.search(pattern, link or "")
         if m:
             return m.group(1)
     return ""
+
+
+def _web_link(link: str) -> str:
+    """把 `api.zhihu.com` 的接口地址换成能打开的网页地址。
+
+    动态接口给「添加了问题」这类条目返回的是 `https://api.zhihu.com/questions/<id>`，
+    在阅读器里点开是一坨 JSON。ID 用的是原始链接（见 `_item_id`），所以这里改显示
+    用的链接不会让老条目的 id 变化。
+    """
+    m = re.match(r"https?://api\.zhihu\.com/(questions|answers|pins)/(\d+)", link or "")
+    if not m:
+        return link
+    path = {"questions": "question", "answers": "answer", "pins": "pin"}[m.group(1)]
+    return f"https://www.zhihu.com/{path}/{m.group(2)}"
+
+
+def _strip_noscript(content: str) -> str:
+    """去掉 <noscript> 兜底块（主要是里面的重复图片）。
+
+    知乎正文的每个 <figure> 里都有两张同样的图：一张是 <noscript> 里的
+    无 JS 兜底，另一张是 RichText-ConditionalImagePortal 里的真实图。
+    阅读器一般会忽略 <noscript> 标签本身、却照常渲染里面的 <img>，
+    同一张图就渲染两次（实测 248 张兜底图全都能在块外找到同一个地址）。
+
+    兜底块里只有图，所以整块丢掉；含别的内容的，拆掉标签、保留内容。
+    """
+    def repl(m: re.Match) -> str:
+        inner = m.group(1)
+        return "" if re.search(r"<img\b", inner, re.I) else inner
+
+    return re.sub(r"<noscript\b[^>]*>(.*?)</noscript>", repl, content,
+                  flags=re.S | re.I)
 
 
 def _clean_zhihu_html(content: str) -> str:
@@ -193,6 +325,8 @@ def _clean_zhihu_html(content: str) -> str:
     """
     if not content:
         return ""
+
+    content = _strip_noscript(content)
 
     def fix_img(m: re.Match) -> str:
         tag = m.group(0)
@@ -292,7 +426,9 @@ class ZhihuProvider(Provider):
     def _to_item(self, o: dict) -> Item:
         created = int(o.get("created") or 0)
         published = datetime.fromtimestamp(created) if created else None
-        link = _link(o)
+        # 接口对「添加了问题」这类动态给的是 api.zhihu.com 的链接，换成能打开的网页地址。
+        # 条目 id 由 _item_id(o) 用原始链接算（见那边的说明），所以这里不影响去重。
+        link = _web_link(_link(o))
         title = o.get("title") or _first_line(o.get("preview", "")) or _action(o)
         preview = o.get("preview", "")
 
@@ -316,8 +452,18 @@ class ZhihuProvider(Provider):
 
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
         items = super().postprocess(items, bridge)
+        # 存量条目的 content 在抓下来那一刻就存进 state 了，光修抓取逻辑清不掉
+        # 里面的 <noscript> 兜底图（这类条目 extra.fulltext 已标记，不会再重抓），
+        # 所以每次跑都统一过一遍。幂等，重复跑没有副作用。
+        for item in items:
+            item.content = _strip_noscript(item.content)
         if self.opt("dedupe_by_content", True):
-            items = _dedupe_by_content(items)
+            items, self.published_content = _dedupe_by_content(
+                items,
+                seen=self.seen_content,
+                memory_days=self.opt("dedupe_memory_days", 45),
+                on_drop=self.note_drop,
+            )
         if self.opt("fulltext", True):
             items = self._enrich_fulltext(items, bridge)
         return items
@@ -336,22 +482,28 @@ class ZhihuProvider(Provider):
 
         if pending:
             print(f"    [全文] 待补 {len(pending)} 篇，本次最多处理 {budget} 篇")
-        todo = [i for i in pending[:budget]
-                if i.extra.get("type") in FULLTEXT_SELECTORS and _id_from_link(i.link)]
+        todo = pending[:budget]
         for n, item in enumerate(todo, 1):
-            item_type = item.extra["type"]
+            item_type = item.extra.get("type", "")
             item_id = _id_from_link(item.link)
             try:
-                body = self._fulltext_with_retry(bridge, item_type, item.link, item_id)
+                # 「添加了问题」这类条目的链接是 api.zhihu.com 的接口地址，
+                # 浏览器要去网页版才有内容（见 _web_link）。
+                body = self._fulltext_with_retry(
+                    bridge, item_type, _web_link(item.link), item_id
+                )
             except Exception as e:
                 print(f"    [全文] 失败 {item_type}/{item_id}: {e}", file=sys.stderr)
             else:
-                item.content = _rebuild_content(item.content, body)
+                if body:
+                    item.content = _rebuild_content(item.content, body)
+                # 抓到空正文也算处理过了（问题本来就可能没有描述），
+                # 否则这条会一直挂在「待补」里，每轮重抓一遍。
                 item.extra["fulltext"] = True
                 # 告诉 Store：这条的 content 已经是最终版，别被重新渲染的摘要覆盖
                 item.extra["content_locked"] = True
-                print(f"    [全文] {n}/{len(todo)} {item_type} {item_id} "
-                      f"({len(body)} 字符)")
+                got = f"{len(body)} 字符" if body else "页面没有正文"
+                print(f"    [全文] {n}/{len(todo)} {item_type} {item_id} ({got})")
             if n < len(todo):
                 time.sleep(random.randint(ITEM_DELAY_MS, ITEM_DELAY_MS + 2000) / 1000)
         return items
@@ -379,9 +531,15 @@ class ZhihuProvider(Provider):
         return self._from_page(bridge, item_type, url)
 
     def _from_page(self, bridge: Bridge, item_type: str, url: str) -> str:
-        title_sels, content_sels = FULLTEXT_SELECTORS[item_type]
+        selectors = FULLTEXT_SELECTORS.get(item_type)
+        if selectors is None:
+            # 知乎新出的动态类型：还没配选择器，明说而不是悄悄当成功
+            raise RuntimeError(f"还没有 {item_type!r} 这类页面的选择器（FULLTEXT_SELECTORS）")
+        title_sels, content_sels = selectors
         # 在当前标签页里导航（不是新开标签），抓完由 session 统一清理
         bridge.call("navigate", {"url": url})
+        # 先等导航落定，再确认没被重定向；正文什么时候算渲染好由下面的
+        # _extract_js 在页面里轮询判断（固定 sleep 会抓到半截）
         time.sleep(PAGE_WAIT_MS / 1000)
 
         final_url = bridge.evaluate("location.href") or ""
@@ -390,7 +548,14 @@ class ZhihuProvider(Provider):
 
         val = bridge.evaluate(_extract_js(title_sels, content_sels))
         if not val or not val.get("hasContent"):
+            if item_type in OPTIONAL_CONTENT_TYPES:
+                # 问题可以没有描述（很常见），页面上就没有那块 —— 不是抓取失败
+                return ""
             raise RuntimeError("未找到页面正文（可能被风控拦截）")
+        if val.get("collapsed"):
+            # 「显示全部」没点上，手里这份是带「…」的半截；与其把它锁进 state，
+            # 不如报失败让上层重来一次
+            raise RuntimeError("正文仍是折叠状态（没能点开「显示全部」）")
 
         return _clean_zhihu_html(val.get("content", ""))
 
@@ -454,26 +619,74 @@ def _dedup_key(item: Item) -> str | None:
     return key
 
 
-def _dedupe_by_content(items: list[Item]) -> list[Item]:
-    """正文相同的只保留一条。
+def _prune_seen(seen: dict[str, str] | None, memory_days) -> dict[str, str]:
+    """丢掉超出保留期的指纹（保留期 0 或负数 = 整份丢掉，即关掉跨窗口去重）。"""
+    if not seen or not memory_days or float(memory_days) <= 0:
+        return {}
+    cutoff = datetime.now() - timedelta(days=float(memory_days))
+    kept: dict[str, str] = {}
+    for key, when in (seen or {}).items():
+        try:
+            t = datetime.fromisoformat(str(when))
+        except ValueError:
+            continue
+        if t >= cutoff:
+            kept[key] = when
+    return kept
+
+
+def _dedupe_by_content(
+    items: list[Item],
+    seen: dict[str, str] | None = None,
+    memory_days=45,
+    on_drop=None,
+) -> tuple[list[Item], dict[str, str]]:
+    """正文相同的只保留一条；并把「这条正文已经发出去过」记进指纹表。
 
     同一条回答会同时以「回答了问题」和「收藏了回答」出现，正文完全一样，
     只有动作不同。保留**较早**的那条：单条内容的生命周期更长，
     RSS 阅读器不会因为动作换了就把它当成新条目重复提醒。
+
+    但**光比窗口内的条目不够**：一对双胞胎里较早的那条（通常就是已经发出去、
+    阅读器里已经有了的那条）会先被 `history` 裁掉，后一条随即成了孤家寡人 ——
+    它的 guid 带着自己的动作和自己的时间（见 `_item_id`），和已发过的那条不同，
+    于是同一篇文章被当成新条目又发了一遍。所以「已经发过哪些正文」得单独记一份，
+    存在 state 的 `seen_content` 里，不跟着条目一起裁（见 Store）。
+
+    seen 就是这份指纹表 {指纹: 首次发布时间 ISO}；memory_days 是它的保留期。
+    返回（保留的条目, 更新后的指纹表）—— 后者由 cli 交回 Store 落盘。
+
+    on_drop(item, reason) 每丢一条调一次，给过滤清单日志用。
     """
-    seen: set[str] = set()
+    registry = _prune_seen(seen, memory_days)
+    now = datetime.now().isoformat(timespec="seconds")
+    in_window: set[str] = set()  # 本轮窗口里已经见过的指纹
+    published = dict(registry)  # 本轮发出去之后，「已发过」的完整名单
     kept: list[Item] = []
+
     for item in sorted(items, key=sort_key):
         key = _dedup_key(item)
         if key is None:
             # 没有正文的（关注了问题等）不参与跨条目去重
             kept.append(item)
             continue
-        if key in seen:
+        if key in in_window:
+            if on_drop is not None:
+                on_drop(item, "正文与另一条重复（dedupe_by_content）")
             continue
-        seen.add(key)
+        in_window.add(key)
+        if key in registry:
+            # 双胞胎里已经发过的那条早被裁掉了，只剩这条 —— 别再发一遍
+            if on_drop is not None:
+                on_drop(
+                    item,
+                    f"正文早先已发布过（首次 {registry[key][:16]}，跨窗口去重）",
+                )
+            continue
+        published.setdefault(key, now)
         kept.append(item)
-    return sorted(kept, key=sort_key, reverse=True)
+
+    return sorted(kept, key=sort_key, reverse=True), published
 
 
 def _first_line(s: str, limit: int = 60) -> str:

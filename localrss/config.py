@@ -22,6 +22,8 @@ class FeedConfig:
     history: int | None = None  # 覆盖 output.history；None 表示用全局默认
     hub_url: str = ""  # 覆盖 output.hub_url；空字符串表示用全局默认
     options: dict = field(default_factory=dict)
+    #: 该源额外的关键词过滤，叠加在顶层 exclude_keywords 之上（只对本源生效）
+    exclude_keywords: list[str] = field(default_factory=list)
 
     @property
     def filename(self) -> str:
@@ -37,11 +39,14 @@ class Config:
     group_title: str
     output_dir: Path
     state_dir: Path
+    log_dir: Path
     history: int
     base_url: str
     hub_url: str
     close_session: bool
     exclude_keywords: list[str]
+    #: 把每轮被过滤掉的条目写一份清单（logs/<feed-id>.dropped.log，覆盖写）
+    dropped_log: bool
     feeds: list[FeedConfig]
 
     def enabled_feeds(self, only: list[str] | None = None) -> list[FeedConfig]:
@@ -92,6 +97,11 @@ def load_config(path: str | Path) -> Config:
                 history=int(entry["history"]) if entry.get("history") else None,
                 hub_url=str(entry.get("hub") or "").rstrip("/"),
                 options=dict(entry.get("options") or {}),
+                exclude_keywords=[
+                    str(k)
+                    for k in (entry.get("exclude_keywords") or [])
+                    if str(k).strip()
+                ],
             )
         )
 
@@ -103,10 +113,12 @@ def load_config(path: str | Path) -> Config:
         group_title=bridge_cfg.get("group_title") or "本地 RSS",
         output_dir=resolve(output_cfg.get("dir"), "output"),
         state_dir=resolve(output_cfg.get("state_dir"), "state"),
+        log_dir=resolve(output_cfg.get("log_dir"), "logs"),
         history=int(output_cfg.get("history", 300)),
         base_url=str(output_cfg.get("base_url") or "").rstrip("/"),
         hub_url=str(output_cfg.get("hub_url") or "").rstrip("/"),
         close_session=bool(bridge_cfg.get("close_session", True)),
+        dropped_log=bool(output_cfg.get("dropped_log", False)),
         exclude_keywords=[
             str(k) for k in (raw.get("exclude_keywords") or []) if str(k).strip()
         ],

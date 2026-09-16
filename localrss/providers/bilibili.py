@@ -589,11 +589,14 @@ class BilibiliProvider(Provider):
 
     def _apply_image_digest(
         self, items: list[Item], size: int, max_age_s: float, show_avatar: bool
-    ) -> tuple[list[Item], list[Item], int]:
-        """把图片动态/转发攒成合集。返回（可见列表，本次新建的合集条目，收进合集的条数）。
+    ) -> tuple[list[Item], list[Item], int, list[Item]]:
+        """把图片动态/转发攒成合集。
+
+        返回（可见列表，本次新建的合集条目，收进合集的条数，还没发出去的存货）。
 
         - 这些条目自己不进 RSS（没并进合集的在里面等着，并过的也不单独出现）；
-        - 攒够 size 条就出一批（先出旧的）；不足 size 但最旧那条超过 max_age_s 也出一批。
+        - 攒够 size 条就出一批（先出旧的）；不足 size 但最旧那条超过 max_age_s 也出一批；
+        - 第四个返回值是发完这批之后还在攒的那些，调用方用来报告队列状态。
         """
         digested = _digested_ids(items)
         image_items = [i for i in items if _item_is_digestable(i)]
@@ -606,7 +609,8 @@ class BilibiliProvider(Provider):
             new.append(_build_digest(batch, show_avatar))
         if pending and max_age_s > 0 and _age_seconds(pending[0].published) >= max_age_s:
             new.append(_build_digest(pending, show_avatar))
-        return visible + new, new, len(image_items)
+            pending = []  # 这批发完了，不再是「在攒」
+        return visible + new, new, len(image_items), pending
 
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
         # items 是 cli 之后要落盘的那个列表（store.save(merged)），
@@ -614,7 +618,9 @@ class BilibiliProvider(Provider):
         merged = items
         items = super().postprocess(items, bridge)
         if self.opt("filter_self_repost", True):
-            items = [i for i in items if not _item_is_self_repost(i)]
+            items = self.drop_unless(
+                items, lambda i: not _item_is_self_repost(i), "转发自本人（filter_self_repost）"
+            )
 
         show_avatar = bool(self.opt("show_avatar", True))
         try:
@@ -623,13 +629,17 @@ class BilibiliProvider(Provider):
             digest_size = 0
 
         new_digests: list[Item] = []
+        pending: list[Item] = []
+        max_age_s = self._digest_max_age_s()
         if digest_size > 0:
             # 开了合集：图片动态和转发一律进合集，filter_image_only 不再参与
-            items, new_digests, self.grouped_items = self._apply_image_digest(
-                items, digest_size, self._digest_max_age_s(), show_avatar
+            items, new_digests, self.grouped_items, pending = self._apply_image_digest(
+                items, digest_size, max_age_s, show_avatar
             )
         elif self.opt("filter_image_only", True):
-            items = [i for i in items if not _item_is_image_only(i)]
+            items = self.drop_unless(
+                items, lambda i: not _item_is_image_only(i), "纯图动态（filter_image_only）"
+            )
 
         if new_digests:
             merged.extend(new_digests)
@@ -637,6 +647,19 @@ class BilibiliProvider(Provider):
             self.derived_items += len(new_digests)
             for d in new_digests:
                 print(f"    [动态合集] 合成 {len(d.extra['digest_ids'])} 条：{d.title}")
+
+        if digest_size > 0:
+            # 每次运行都报一下队列：合集是「攒够才发」，不报的话看着就像一直不更新。
+            note = f"在攒 {len(pending)}/{digest_size} 条"
+            if pending:
+                note += f"（还差 {digest_size - len(pending)} 条）"
+                hours = _age_seconds(pending[0].published) / 3600
+                note += f"；最旧一条 {hours:.1f}h 前"
+                note += (f"，满 {max_age_s / 3600:g}h 也会照样发"
+                         if max_age_s > 0 else "，不兜底（攒满才发）")
+            else:
+                note += "，攒满就发"
+            print(f"    [动态合集] {note}")
 
         # 头像和播放器在这里加/摘，而不是抓取时定死 —— 这样改开关立刻生效，
         # 不用重抓（两个操作都是幂等的：先摘掉旧的，再按当前开关加回去）。

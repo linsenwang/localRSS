@@ -65,6 +65,9 @@ python3 rss.py --list-types    # 列出已支持的站点类型
 ./main.sh restart          # 重启 pm2 抓取任务（等于立刻跑一次）
 ```
 
+> 被过滤掉的条目（命中了哪个关键词 / 被哪条规则丢的）在 `logs/<feed-id>.dropped.log`
+> 里，每次运行覆盖写，详见「过滤与去重规则 · 过滤清单」。
+
 `status` 大概长这样：
 
 ```
@@ -113,7 +116,8 @@ rm state/*.json && ./main.sh
 ```
 
 会重新抓全量。代价：知乎全文（`content_locked`）一起没了，需要按
-`max_fulltext_per_run` 分批重新补齐。
+`max_fulltext_per_run` 分批重新补齐；跨窗口的去重指纹（`seen_content`）也没了，
+已经发过的正文可能被重发一次（一次运行就会重新攒回来）。
 
 ## 改了配置多久生效
 
@@ -121,7 +125,8 @@ rm state/*.json && ./main.sh
 |----------|----------|
 | `exclude_keywords` | **立即** |
 | `filter_self_repost` / `filter_image_only` | **立即** |
-| `dedupe_by_content` | **立即** |
+| `dedupe_by_content` / `dedupe_memory_days` | **立即** |
+| `output.dropped_log` | 下次运行（只是多写一份过滤清单，不影响 RSS 内容） |
 | `show_avatar` / `embed_player` | **立即** |
 | `image_digest_size` / `image_digest_max_age_hours` | 下次运行。**正文会跟着重渲染，但已经分好的批次不会重排** —— 要重来就删掉 state 里那些 `extra.kind == "image_digest"` 的条目 |
 | `max_pages` / `fulltext` / `max_fulltext_per_run` | 下次运行 |
@@ -563,12 +568,15 @@ bridge:
 output:
   dir: output        # RSS 输出目录（相对 config.yaml 所在目录）
   state_dir: state   # 去重/增量用的状态目录
+  log_dir: logs      # 过滤清单的目录（见下面的 dropped_log）
+  dropped_log: true  # 每轮把被过滤掉的条目写成 <log_dir>/<feed-id>.dropped.log（覆盖写）
   history: 150       # 每个源最多保留多少条（可被各 feed 的 history 覆盖）
   base_url: ""       # 可选，服务地址前缀（开了 WebSub 后就是 hub 抓 feed 用的那个地址）
   hub_url: ""        # 可选，WebSub hub 地址；留空 = 关闭（见「WebSub」一节）
 
 # 全局关键词过滤：标题或正文命中任一关键词的条目会被丢掉。
 # 对所有 feeds 生效，不想要就清空这个列表。
+# 只想拦某个源的，就写在那个 feed 自己的 exclude_keywords 里（见下），别放这里。
 exclude_keywords:
   - 妙界
   - 互动抽奖
@@ -583,6 +591,8 @@ feeds:
     file: bilibili-follow.xml  # 可选，自定义输出文件名
     enabled: true              # 可选，false 则跳过
     history: 150               # 可选，覆盖 output.history（按源单独设上限）
+    exclude_keywords:          # 可选，只对本源生效，叠加在顶层的全局列表之上
+      - 关于每天的早安行动
     options:                   # provider 各自的参数
       mode: feed
       max_pages: 3
@@ -654,7 +664,8 @@ q9adg 房车博主大批消失，床车自驾爆火，二者差距到底有多�
 |----|------|------|
 | `token` | — | 主页 URL 里的 token，如 `https://www.zhihu.com/people/kvxjr369f` → `kvxjr369f` |
 | `max_pages` | `5` | 最多翻几页 |
-| `dedupe_by_content` | `true` | 正文相同的只保留一条 |
+| `dedupe_by_content` | `true` | 正文相同的只保留一条（跨窗口，见下） |
+| `dedupe_memory_days` | `45` | 去重指纹记多久（0 = 只比窗口内的条目） |
 | `fulltext` | `true` | 导航到内容页抓全文 |
 | `max_fulltext_per_run` | `10` | 每次运行最多补几篇全文 |
 | `list_retries` | `2` | 列表接口偶发风控时的重试次数 |
@@ -732,7 +743,7 @@ WKWebView 对这种 DOM 全屏支持很差，退出时留下黑色图层。
 ### zhihu · `fulltext`
 
 把动态的**预览摘要替换成全文**。抓取方式照搬 `kvxjr369f/zhihu_fulltext.py`：
-导航到内容页 → 等 3 秒渲染 → 从 DOM 取正文。
+导航到内容页 → 等正文渲染完 → 从 DOM 取正文。
 
 几个关键设计：
 
@@ -744,6 +755,65 @@ WKWebView 对这种 DOM 全屏支持很差，退出时留下黑色图层。
   回答和文章只能走页面——文章的 `api/v4/articles/<id>` 直接返回
   `403 请求参数异常`，接口拿不到。
 - 重试：文章 4 次、回答/想法 2 次，间隔 10~12 秒。
+- **「待补 N 篇」= 所有还没有 `extra.fulltext` 的条目**，一条都不少算。
+  补不了的类型不会被悄悄跳过 —— 抓失败或没有对应的页面选择器都会打印出来，
+  否则提示每轮都停在同一个数上，看着像卡死了。
+
+支持的类型（`FULLTEXT_SELECTORS`）：
+
+| 动态类型 | 正文取哪儿 |
+|----------|------------|
+| `answer` | 回答页 `.AnswerCard .RichText` |
+| `article` | 文章页 `.Post-RichText` |
+| `pin` | 优先 `api/v4/pins/<id>`，失败退回想法页 |
+| `question` | 问题页的问题描述（`.QuestionRichText`） |
+
+`question` 对应「添加了问题」这类动态：正文就是问题的**描述（补充说明）**。
+它是折叠的（只给半截 + 「显示全部」按钮），`_extract_js` 会点开再取；
+**问题可以没有描述**，那种情况页面上没这块内容，抓完按「页面没有正文」记一笔
+（同样打 `fulltext` 标记），不会一直挂在待补里反复重抓。
+
+这类动态的链接在接口里是 `https://api.zhihu.com/questions/<id>`（点开是一坨 JSON），
+`_web_link()` 会换成 `https://www.zhihu.com/question/<id>`。条目 id 仍然用原始链接算
+（见 `_item_id`），所以换链接不会让老条目变成新条目。
+
+#### 正文不能取「第一帧」
+
+长回答是**分阶段**渲染的：页面先给一小段，随后整篇才替换进来。原来的实现是
+导航后固定等 3 秒再取 `.RichText` 的 `innerHTML`，实测会稳定地抓到那个半截版本，
+而且因为**每条只抓一次**，半截版会被 `content_locked` 永久锁进 state：
+
+```
+酱紫君 《红警 2》的残酷电脑为什么在打完几波以后不继续发展了？
+  抓到：2080 字符 HTML，正文 482 字（停在「…不得不变卖建筑。」）
+  页面：4111 字符 HTML，正文 1573 字
+```
+
+现在改成在页面里轮询（`CONTENT_*` 几个常量）：长度连续 1.5 秒不变才认为渲染完，
+至少等 3 秒、最多 20 秒，中途取到更长的就留着；顺手点掉折叠正文上的「阅读全文」
+（只在按钮文字是 `阅读全文`/`展开` 时点，已展开时不会误触）。
+取到的最长结果会被保留，所以万一展开反而让 DOM 变短，也不会把正文弄丢。
+
+> ⚠️ **已经抓错的存量条目不会自己好**：它们带着 `extra.fulltext` / `content_locked`，
+> 不会再被抓一次。要重抓，把这两个键从 `state/<id>.json` 里删掉即可
+> （`dedup_key` 留着），下次运行会按 `max_fulltext_per_run` 分批补齐。
+> 批量重置某一个源：
+>
+> ```bash
+> python3 - <<'PY'
+> from localrss.store import Store
+> s = Store('state/zhihu-GalAster.json')
+> items = s.load()
+> for i in items:
+>     if i.extra.get('fulltext'):
+>         i.extra.pop('fulltext', None)
+>         i.extra.pop('content_locked', None)
+> s.save(items)
+> PY
+> ```
+>
+> 这条命令只**删标记**、不删条目（`save()` 不做裁切），重置后每条都要重新付一次抓取代价 ——
+> 一个源 40 条、`max_fulltext_per_run: 10`，大概要四轮运行才补完。
 
 配套修了个 state 的 bug：`Store.merge` 原本会用本次重新渲染的裸摘要覆盖老条目，
 **把已经抓好的全文冲掉**，导致每一轮都在重抓同一批。
@@ -752,13 +822,54 @@ WKWebView 对这种 DOM 全屏支持很差，退出时留下黑色图层。
 
 正文长度实测：最长 36989 字符，中位 1515。state 约 200 KB，RSS 约 180 KB。
 
+#### 图片别渲染两次
+
+知乎正文的每个 `<figure>` 里其实有**两张一样的图**：一张在 `<noscript>` 兜底块里
+（无 JS 时的降级图），另一张在 `RichText-ConditionalImagePortal` 里。阅读器一般会忽略
+`<noscript>` 标签本身、却照常渲染里面的 `<img>`，于是同一张图渲染两次。
+
+`_strip_noscript()` 把兜底块整块丢掉 —— 实测 248 张兜底图的地址在块外都能找到同一份，
+不会丢图；块里含图以外内容的（比如 `<video>`），只拆掉标签、内容留着。
+
+> 存量条目不用手动重置：`postprocess` 每轮都会对合并后的全量条目过一遍
+> `_strip_noscript()`（幂等，重复跑无副作用），所以带重复图的老条目跑一轮就自己好了。
+> 这点和全文不同 —— 全文抓错了必须删标记重抓（见上），这个只改渲染结果，不依赖重新抓取。
+
 ## 过滤与去重规则
 
 过滤规则都在 `postprocess` 里对**最终列表**执行，
 也就是作用在「历史状态 + 本次新增」合并之后 —— 所以改规则不用清状态文件，存量条目会立刻被重新筛一遍。
 过滤只影响 RSS 输出，`state/<id>.json` 里始终保留全量，把开关关掉就全部回来。
 
-### 关键词过滤（全局）
+### 过滤清单（`dropped_log`）：丢了哪些、为什么丢
+
+日志里只会说「过滤掉 N 条」，看不出丢的是哪几条。想看明细就把 `output.dropped_log` 打开：
+
+```yaml
+output:
+  log_dir: logs        # 清单写这里，可省略（默认 logs）
+  dropped_log: true    # 默认 false
+```
+
+每个源写一份 `logs/<feed-id>.dropped.log`，**每次运行直接覆盖**（不是追加），
+所以文件很小，等于「最近一轮过滤了什么」的快照：
+
+```
+# 过滤清单：每次运行覆盖写（生成于 2026-09-16 08:32:10）
+# feed = zhihu-kvxjr369f (zhihu)  本轮 60 条 → 可见 39 条，过滤掉 21 条
+# 原因 | 时间 | 标题 | 链接
+关键词「关于每天的早安行动」 | 2026-09-15 07:02 | 发布了想法 | https://www.zhihu.com/pin/...
+正文与另一条重复（dedupe_by_content） | 2026-09-14 22:41 | 收藏了回答 | https://www.zhihu.com/answer/...
+正文早先已发布过（首次 2026-09-13T16:00，跨窗口去重） | 2026-09-16 11:33 | 收藏了回答 | https://www.zhihu.com/answer/...
+```
+
+- 覆盖写是有意的：始终只有一份、永远对应当前这轮。一条没丢时也会写一个空清单，
+  免得上一轮的内容留在文件里冒充本轮结果（想比历史就把文件 `cp` 走）。
+- 每条都带原因（命中的那个关键词 / 哪条规则丢的），用来核对关键词有没有误伤。
+- 纯为人看的，跟 RSS 和 `state/` 无关；写失败只打一条 stderr，不影响本轮抓取。
+- 明细里的条数应当等于终端里那个「过滤掉 N 条」——对不上就说明有条丢弃路径没记原因，可以提出来。
+
+### 关键词过滤（全局 / 单个源）
 
 在 `config.yaml` 顶层配一个列表，**对所有 feeds 生效**：
 
@@ -769,7 +880,20 @@ exclude_keywords:
   - 捞一下
 ```
 
-匹配规则：
+只想拦某一个源（比如某个号的自动早安播报），就写在该 feed 自己的 `exclude_keywords` 里，
+它和全局列表是**叠加**关系，只对这个源生效，别的源不受影响：
+
+```yaml
+feeds:
+  - id: zhihu-kvxjr369f
+    type: zhihu
+    # ...
+    exclude_keywords:
+      - 关于每天的早安行动
+      - 关于素问每日晚间抢答对战
+```
+
+匹配规则（全局和 feed 级完全一致）：
 
 - 匹配范围是**标题 + 正文**（正文会先剥掉 HTML 标签）。
 - **大小写不敏感**的子串匹配。`Rokid` 能命中 `rokid`，`APPLE LOG课程` 能命中 `Apple Log课程`。
@@ -778,7 +902,8 @@ exclude_keywords:
 - 清空列表 = 关掉这个功能。
 
 实现在 `Provider.postprocess()` 基类里，所以**任何站点都自动有**，
-不需要每个 provider 各写一遍。
+不需要每个 provider 各写一遍。两个列表在 `cli.py` 拼好之后交给 provider，
+provider 拿到的始终是一个合并后的列表。
 
 ### bilibili · `filter_self_repost`
 
@@ -832,6 +957,19 @@ exclude_keywords:
 - **兜底**：剩下的不足 N 条、且最旧那条已经超过 `image_digest_max_age_hours` 小时，
   就按现有条数照样出一条 —— 免得冷清的时候几条内容永远不出现在 RSS 里。
   设成 `0` 就是「一直攒着，攒够才出」。
+
+每次运行都会报一下队列，攒到哪儿了一眼能看见：
+
+```
+  [动态合集] 合成 10 条：动态合集 旋风凉水、特厨魏味-、游戏星GameStar
+  [动态合集] 在攒 7/10 条（还差 3 条）；最旧一条 14.8h 前，满 24h 也会照样发
+```
+
+**「合集怎么不更新」看这一行就够了**：它没坏，只是还在攒 —— 队列没满 N 条，
+最旧那条也还没到兜底时限，所以这一轮不发。队列变慢最常见的原因是关注流里图文/转发
+本来就少；另外「转发自 @自己」会被 `filter_self_repost` 提前丢掉，不进队列
+（它们照样留在 state 里，只是永远不参与合集）。想发得更勤就调
+`image_digest_size`（改小）或 `image_digest_max_age_hours`（改小）—— 都是下次运行生效。
 
 实现上不需要额外的队列文件：合集是个普通条目，存进 `state/*.json`，
 并且把「合成过哪几条」记在自己的 `extra.digest_ids` 里。所以
@@ -949,9 +1087,41 @@ RSS 阅读器会把它当成一条新内容重复提醒。
 从渲染好的 `content` 里取正文（首段是动作、以 `<a ` 开头的是链接段，剩下的就是正文），
 所以老的 `state/*.json` 也能直接吃这套规则，不需要迁移。
 
+#### 去重指纹要跨窗口记（`dedupe_memory_days`）
+
+**只比「窗口内的条目」不够，会漏掉一类重复。** 一对双胞胎里较早的那条通常就是
+已经发出去、阅读器里已经有了的那条；它先被 `history` 裁掉之后，后一条成了孤家寡人 ——
+它的 guid 由「动作 + 标题 + 链接 + 自己的时间」算出来（见 `_item_id`），
+和已发过的那条**不一样**，于是同一篇文章被当成新条目又发了一遍。
+
+实测就是这种情况（`logs/pm2-out.log`）：
+
+```
+2026-09-13T16:00:16:  [全文] 1/1 answer 2082498339958961570 (1987 字符)   ← 先发的是「回答了问题」
+2026-09-16T12:01:10:  [全文] 4/4 answer 2082498339958961570 (2557 字符)   ← 三天后「收藏了回答」又发了一遍
+2026-09-13T17:30:17:  [全文] 2/2 answer 2082517234208060113 (878 字符)
+2026-09-16T13:00:36:  [全文] 2/2 answer 2082517234208060113 (1162 字符)
+```
+
+两次的正文 id 一样、条目 id 不同 —— 后一条是「收藏了回答」，前面那条被 `history`
+挤出去之后再没人跟它比。这也是「知乎老是刷出旧文章」的由来。
+
+所以指纹（`md5(正文)`）**单独存一份**：`state/<id>.json` 的 `seen_content`
+（`{指纹: 首次发布时间}`）。条目会被 `history` 裁掉，这份表不会 ——
+`dedupe_memory_days`（默认 45 天）到期的指纹才会被清掉。
+
+- 判据还是**正文**。已经发过的正文再来一个动作（收藏 / 赞同 / 改标题后重抓），
+  一律不再发第二遍，过滤清单里的原因是
+  `正文早先已发布过（首次 2026-09-13T16:00，跨窗口去重）`。
+- 记的是「**发出去过**」而不是「见过」：条目被关键词过滤掉不算发过。
+- 表只在 RSS 输出这条路上起作用，`state` 里的条目一条不动；把 `dedupe_memory_days`
+  调小或设 0，下次运行就会把表裁掉/清空，退回老行为（旧文章会再被重发一次）。
+- 表的大小：够活跃的源一天几十条，45 天几百个指纹，几十 KB —— 比同源的 `items` 小得多。
+
 ⚠️ 判定依据是**正文文本**，不是链接。如果同一个人先后发了两条文字一模一样的想法，
 也会被合并成一条 —— 这正是「按 description 去重」的含义，但确实会合并掉两个不同的
-pin ID。不想要这个行为就把 `dedupe_by_content` 设成 `false`。
+pin ID。不想要这个行为就把 `dedupe_by_content` 设成 `false`；
+只是不想记那么久，就调小 `dedupe_memory_days`（比如 `7`）。
 
 ## 新增一个网站
 
@@ -993,8 +1163,10 @@ pin ID。不想要这个行为就把 `dedupe_by_content` 设成 `false`。
 - **过滤/去重写在 `postprocess()` 里**，别写在 `fetch()` 里。`fetch()` 只拿到本次新条目，
   而 `postprocess()` 拿到的是合并后的完整列表，改规则时存量数据也会被重新筛一遍。
   覆盖 `postprocess()` 时记得先 `super().postprocess(items)`，
-  基类那次调用负责全局关键词过滤。
+  基类那次调用负责关键词过滤（全局 + 该源自己的 `exclude_keywords`）。
   参考 `bilibili.py` 的 `filter_self_repost` 和 `zhihu.py` 的 `dedupe_by_content`。
+  丢条目时用 `self.drop_unless(items, keep, reason)`（或直接 `self.note_drop(item, reason)`），
+  这样过滤清单日志里也能看到这条是被谁丢的（见「过滤清单」）。
 
 ## 文件结构
 
@@ -1026,8 +1198,8 @@ local_rss/
 │       ├── bilibili.py
 │       └── zhihu.py
 ├── output/                  # 生成的 RSS
-├── state/                   # 每个源一份 JSON（去重）+ hub.json（WebSub 订阅关系）
-└── logs/                    # pm2 / launchd / cron 的输出
+├── state/                   # 每个源一份 JSON（条目 + 跨窗口去重指纹）+ hub.json（WebSub 订阅关系）
+└── logs/                    # pm2 / launchd / cron 的输出 + <feed-id>.dropped.log 过滤清单
 ```
 
 ## 常见问题
