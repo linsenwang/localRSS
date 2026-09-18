@@ -53,13 +53,18 @@ class Provider:
         #: cli 拿它写「过滤清单」日志（见 config.yaml 的 output.dropped_log），
         #: 用来回头核对规则是不是误伤 —— 光看「过滤掉 N 条」看不出丢的是哪些。
         self.dropped_items: list[tuple[Item, str]] = []
-        #: 跨窗口的正文指纹表 {指纹: 首次发布时间 ISO}，postprocess 之前由 cli
-        #: 从 state 里读出来塞进来。这份表不跟着 history 一起裁，所以「这条正文
-        #: 已经发出去过」不会随着条目滚出窗口就忘掉（见 zhihu.py 的 _dedupe_by_content）。
+        #: 跨窗口的正文指纹表 {指纹: "首次发布时间|发布它的条目 id"}，postprocess
+        #: 之前由 cli 从 state 里读出来塞进来。这份表不跟着 history 一起裁，所以
+        #: 「这条正文已经发出去过」不会随着条目滚出窗口就忘掉；值里带上发布者，
+        #: 才分得清「同一条又走了一遍」和「孪生那条发过了」（见 _dedupe_by_content）。
         self.seen_content: dict[str, str] = {}
         #: 本轮过后「已经发出去过」的指纹表，由用它的 provider 填写；
         #: None = 这个 provider 不用跨窗口去重，cli 就不会覆盖 state 里那份。
         self.published_content: dict[str, str] | None = None
+        #: prune_superseded 丢掉的条目 id，供子类在 postprocess 里参考 ——
+        #: 知乎的跨窗口去重要知道「这条已经被新版本取代了」，否则会拿旧版本
+        #: 登记的指纹把新版本拦下来。
+        self.superseded_ids: set[str] = set()
 
     def opt(self, key: str, default=None):
         value = self.options.get(key)
@@ -106,6 +111,17 @@ class Provider:
     def setup(self, bridge: Bridge) -> None:
         """切换到正确的标签页；默认实现足够，一般不用改。"""
         bridge.ensure_tab(self.page_url(), group_title=self.opt("group_title"))
+
+    def prune_superseded(self, items: list[Item]) -> list[Item]:
+        """剔掉已经被新版本取代的旧条目；默认什么都不做。
+
+        由 cli 在「合并进 state 之后、postprocess 之前」调用，所以丢掉的条目
+        不会再进 state，也不会出现在 RSS 里。
+
+        知乎那边用它处理编辑：动态接口只返回内容的**当前版本**，被编辑过的旧条目
+        留在 state 里既不会再被刷新，又白占 history 的位置（见 zhihu.py）。
+        """
+        return items
 
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
         """对条目列表做过滤/去重/补全。

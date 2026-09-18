@@ -22,6 +22,27 @@ def _rfc822(dt: datetime | None) -> str | None:
     return format_datetime(dt)
 
 
+def _updated_at(item: Item) -> datetime | None:
+    """条目内容的最后编辑时间（provider 塞在 `extra.updated` 的 unix 时间戳）。
+
+    只有比发布时间**晚**才算数：回答被编辑过之后又被赞同/收藏，那条动态的时间比
+    编辑时间还晚（先编辑、后点赞），pubDate 用编辑时间会往回跳，所以那种情况返回
+    None，让调用方退回 `item.published`。没编辑过时两者相等，同样返回 None。
+
+    目前只有知乎会填这个字段，别的站点没有，取到 None。
+    """
+    ts = item.extra.get("updated") if isinstance(item.extra, dict) else None
+    if not ts:
+        return None
+    try:
+        ts = int(ts)
+        if item.published and ts <= int(item.published.timestamp()):
+            return None
+        return datetime.fromtimestamp(ts).astimezone()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
 def build_rss(
     title: str,
     link: str,
@@ -60,7 +81,11 @@ def build_rss(
         if item.author:
             out.append(f"<dc:creator>{escape(item.author)}</dc:creator>")
         out.append(f'<guid isPermaLink="false">{escape(item.id)}</guid>')
-        published = _rfc822(item.published)
+        # pubDate 取「原发布时间」和「内容最后编辑时间」里较晚的那个：阅读器大多按
+        # 它排序和提醒，编辑过的条目还用原发布时间的话，新版本收下来也埋在原来的
+        # 位置里，等于白收。注意 feed 里条目的**顺序**、`history` 裁剪、去重
+        # 「留早的那条」仍然按 `item.published` 走，两者不必一致 —— 见 models.sort_key。
+        published = _rfc822(_updated_at(item) or item.published)
         if published:
             out.append(f"<pubDate>{published}</pubDate>")
         out.append(f"<description>{_cdata(item.content)}</description>")

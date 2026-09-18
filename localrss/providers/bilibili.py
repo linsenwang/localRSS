@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 from datetime import datetime
 
 from ..bridge import Bridge
@@ -132,6 +133,100 @@ EXTRACT_JS = r"""
   }
 })()
 """
+
+
+# ---------- 全文 ----------
+#
+# 动态接口给的正文是**截断**的：opus 内容超过约 300 字就只回开头一段，末尾补一个
+# "..."。全文在 opus 页里，而那个页面是服务端渲染的 —— 实测直接 fetch 就能拿到
+# 54 KB HTML，`.opus-module-content` 里就是完整正文。所以不用像知乎那样开页面等渲染，
+# 一个 fetch + DOMParser 就够（跨域也没问题，在 t.bilibili.com 上实测读得到）。
+
+OPUS_URL = "https://www.bilibili.com/opus/"
+
+#: 正文里嵌的 opus 链接：顶层就是它自己的，转发里嵌的是原动态的
+_OPUS_HREF_RE = re.compile(r'href="[^"]*?/opus/(\d+)"')
+#: 一个段落。摘要里的换行在接口那层已经变成 <br> 了，p 里没有嵌套的 p。
+_PARA_RE = re.compile(r"<p>([\s\S]*?)</p>")
+#: 被平台截断的段落：以 "..." 结尾（前面可能跟着一个 <br>）
+_TRUNCATED_RE = re.compile(r"(?:<br\s*/?>)?\.\.\.\s*$")
+#: 「这条动态自己就是一篇 opus」的类型。AV / 合集更新的正文是视频简介，
+#: 接口给的就是全文，不需要补。
+OPUS_TYPES = {"DYNAMIC_TYPE_DRAW", "DYNAMIC_TYPE_ARTICLE"}
+
+FULLTEXT_JS = r"""
+(async () => {
+  try {
+    const r = await fetch('__URL__', { credentials: 'include' });
+    if (!r.ok) return { ok: false, status: r.status, error: 'HTTP ' + r.status };
+    const html = await r.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const el = doc.querySelector('.opus-module-content');
+    if (!el || !el.innerHTML.trim()) {
+      return { ok: false, status: r.status, error: '页面上没有 .opus-module-content' };
+    }
+    return { ok: true, status: r.status, html: el.innerHTML };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+})()
+"""
+
+
+def _text_of_html(s: str) -> str:
+    """HTML 的可见文本：去标签、还原实体，**去掉所有空白**。
+
+    去空白是为了能拿接口给的摘要去页面正文里对位置 —— 两边换行和缩进都不一样，
+    只有字能对上。
+    """
+    return re.sub(r"\s+", "", html.unescape(re.sub(r"<[^>]+>", "", s or "")))
+
+
+def _drop_empty_styles(s: str) -> str:
+    """去掉 `style="background:;color:;"` 这种空壳样式（opus 正文里到处都是）。"""
+    def repl(m: re.Match) -> str:
+        decls = [d for d in m.group(1).split(";") if d.strip()]
+        if decls and all(d.split(":", 1)[-1].strip() == "" for d in decls):
+            return ""
+        return m.group(0)
+
+    return re.sub(r'\s*style="([^"]*)"', repl, s)
+
+
+def _clean_opus_html(s: str) -> str:
+    """把 opus 页里取来的正文 HTML 收拾成能塞进 RSS 的样子。"""
+    s = re.sub(r"<(script|style)\b.*?</\1>", "", s, flags=re.S | re.I)
+    s = _drop_empty_styles(s)
+    # 页面里的链接/图片地址有相对写法（`/opus/xxx`、`//i0.hdslb.com/...`），
+    # 阅读器多半在别的域下打开，不补全就点不动、显示不出来。
+    return re.sub(r'(src|href)="([^"]*)"',
+                  lambda m: f'{m.group(1)}="{_abs_url(m.group(2))}"', s).strip()
+
+
+def _truncated_para(item: Item) -> tuple[re.Match, str] | None:
+    """找出正文里第一个被平台截断的段落，以及该去哪儿取它的全文。
+
+    URL 的取法：段落**前面最近**的那个 opus 链接 —— 顶层是这条动态自己的，转发里
+    嵌的那个是原动态的；没有链接时，如果这条动态自己就是一篇 opus（图文 / 文章），
+    用 `opus/<动态号>`（实测 opus 号就是动态号）。
+
+    返回 None = 没有可补的：要么没被截断，要么那个 "..." 是作者自己写的
+    （视频简介里很常见），要么这条动态的正文根本不在 opus 页上。
+    """
+    content = item.content or ""
+    link = ""
+    for m in _PARA_RE.finditer(content):
+        hrefs = _OPUS_HREF_RE.findall(m.group(1))
+        if hrefs:
+            link = OPUS_URL + hrefs[0]
+        if not _TRUNCATED_RE.search(m.group(1)):
+            continue
+        if link:
+            return m, link
+        if item.extra.get("type") in OPUS_TYPES:
+            return m, OPUS_URL + item.id.split(":", 1)[-1]
+        return None
+    return None
 
 
 def _abs_url(u: str) -> str:
@@ -612,6 +707,61 @@ class BilibiliProvider(Provider):
             pending = []  # 这批发完了，不再是「在攒」
         return visible + new, new, len(image_items), pending
 
+    # ---------- 全文 ----------
+
+    def _enrich_fulltext(self, items: list[Item], bridge: Bridge) -> list[Item]:
+        """把被平台截断的正文补成全文。
+
+        只换掉那一**段**被截断的段落：标题链接、图片、转发包装都原样留着。图片继续
+        用接口给的那几张 —— opus 页的 HTML 里反而不带图（实测那篇 2774 字的文章，
+        正文里一张 img 都没有，图片是客户端再插进来的），所以别拿页面正文去覆盖图片。
+
+        每条只补一次（extra.fulltext），补完顺手打上 content_locked：否则下一轮
+        Store.merge 会用重新渲染出来的摘要把正文盖回去。
+        """
+        budget = int(self.opt("max_fulltext_per_run", 10))
+        todo: list[tuple[Item, re.Match, str]] = []
+        for item in items:
+            if item.extra.get("fulltext") or item.extra.get("kind"):
+                # kind = 图片合集：那是好多条动态拼出来的，正文里可能有好几段 opus
+                continue
+            found = _truncated_para(item)
+            if found:
+                todo.append((item, found[0], found[1]))
+        if budget <= 0 or not todo:
+            return items
+
+        total = min(len(todo), budget)
+        print(f"    [全文] 待补 {len(todo)} 篇，本次最多处理 {budget} 篇")
+        for n, (item, para, url) in enumerate(todo[:budget], 1):
+            result = bridge.evaluate(FULLTEXT_JS.replace("__URL__", url)) or {}
+            if not result.get("ok"):
+                detail = result.get("error") or result
+                print(f"    [全文] 失败 {url}: {detail}", file=sys.stderr)
+                if not result.get("status"):
+                    continue  # 连响应都没拿到（网络/风控），留着下轮重试
+                item.extra["fulltext"] = True  # 页面在，但没内容 —— 别再每轮重试
+                got = f"取不到（{detail}）"
+            else:
+                body = _clean_opus_html(result.get("html") or "")
+                # 摘要里用 `[图片]` 占位（那个位置在正文里是图），页面正文里没有这个
+                # 标记、图片本身也不在 SSR 的 HTML 里，所以比对前先把它去掉。
+                head = _text_of_html(para.group(1)).replace("[图片]", "")
+                head = head[:-3] if head.endswith("...") else head
+                if body and head and _text_of_html(body).startswith(head[:80]):
+                    # 整段替换（body 本身就是一串 <p>，不能再套一层）
+                    item.content = (item.content[:para.start()] + body
+                                    + item.content[para.end():])
+                    item.extra["fulltext"] = True
+                    item.extra["content_locked"] = True
+                    got = f"{len(body)} 字符"
+                else:
+                    # 不标记，下一轮还会再试：万一是选择器或比对规则的问题，改好之后
+                    # 这些条目自己就补上了（标记了就永远补不上）。
+                    got = "页面正文对不上，原样保留（下轮重试）"
+            print(f"    [全文] {n}/{total} {item.id} ({got})")
+        return items
+
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
         # items 是 cli 之后要落盘的那个列表（store.save(merged)），
         # 新建的合集必须留在里面，否则下次运行看不到 digest_ids，同一批图片会被重复合成。
@@ -621,6 +771,10 @@ class BilibiliProvider(Provider):
             items = self.drop_unless(
                 items, lambda i: not _item_is_self_repost(i), "转发自本人（filter_self_repost）"
             )
+
+        # 补全文要放在合集之前：合集是从成员条目拼出来的，先补好，拼进去的才是全文。
+        if self.opt("fulltext", True):
+            items = self._enrich_fulltext(items, bridge)
 
         show_avatar = bool(self.opt("show_avatar", True))
         try:

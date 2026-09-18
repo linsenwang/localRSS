@@ -107,6 +107,9 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
     # 跨窗口的去重指纹：窗口内的对比靠条目本身，窗口外的靠这份表
     # （条目会被 history 裁掉，表不会 —— 见 providers/zhihu.py 的 _dedupe_by_content）
     provider.seen_content = store.seen_content()
+    # 剔掉被新版本取代的旧条目（知乎的编辑，见 Provider.prune_superseded）。
+    # 放在 postprocess 之前：这些条目在站点上已经不存在了，不该再走一遍过滤/补全。
+    merged = provider.prune_superseded(merged)
     # 过滤/去重/补全放在合并之后：改规则时存量条目也会被重新筛一遍
     visible = provider.postprocess(merged, bridge)
     # provider 填了新表才覆盖（None = 这个 provider 不玩跨窗口去重）

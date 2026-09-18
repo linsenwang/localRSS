@@ -93,6 +93,9 @@ feeds:
       # 上面的 image_digest_size > 0 时本项不再生效；image_digest_size = 0 时才是
       # 「过滤掉纯图动态」
       filter_image_only: true
+      # 接口给的正文是**截断**的：opus 内容超过约 300 字只回开头一段，末尾补个 "..."。
+      # 默认会把被截断的那几条补成全文（去 opus 页取，见 README 的「bilibili · 全文」）。
+      # 关掉写 fulltext: false；一次运行最多补几篇看 max_fulltext_per_run（默认 10）。
       # 在每条正文开头放 UP 主头像（RSS 没有「每条一个图标」的字段，只能这样带出来）
       show_avatar: false
       # 视频动态内嵌 B 站播放器（<iframe>）。实测能用的排前面：

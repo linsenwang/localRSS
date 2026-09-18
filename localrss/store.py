@@ -19,7 +19,7 @@ class Store:
     def __init__(self, path: Path, history: int = 300):
         self.path = Path(path)
         self.history = max(1, int(history))
-        #: 跨窗口的正文指纹表 {指纹: 首次发布时间 ISO}，见 set_seen_content
+        #: 跨窗口的正文指纹表 {指纹: "首次发布时间|发布它的条目 id"}，见 set_seen_content
         self._seen: dict[str, str] = {}
         self._seen_loaded = False
 

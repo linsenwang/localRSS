@@ -76,6 +76,9 @@ EXTRACT_JS = r"""
       verb: a.verb || '',
       action: a.action_text || '',
       created: a.created_time || t.created_time || 0,
+      // 内容最后一次被编辑的时间。回答/文章是 updated_time，想法（pin）是
+      // updated（没有 _time 后缀）；问题类动态的 target 不带这个字段，取到 0。
+      updated: t.updated_time || t.updated || 0,
       target_type: t.type || '',
       target_id: t.id || '',
       title: t.title || q.title || '',
@@ -373,10 +376,20 @@ def _action(o: dict) -> str:
 
 
 def _item_id(o: dict) -> str:
-    """时间戳 + 内容哈希：稳定、可排序，且不受平台换 ID 影响。"""
+    """时间戳 + 编辑时间 + 内容哈希：稳定、可排序，且不受平台换 ID 影响。
+
+    `updated` 是有意编进来的：内容被编辑后 guid 跟着变，阅读器才会把新版本
+    当成新条目收下来 —— guid 不变的话它不会去刷新已经收过的条目（见 README
+    的「阅读器那一侧的缓存」）。拿不到 updated 的类型（目前只有问题）退回老形式。
+    """
     raw = f"{_action(o)}|{o.get('title', '')}|{_link(o)}"
-    created = o.get("created") or 0
-    return f"zhihu:{int(created)}_{_short_hash(raw)}" if created else f"zhihu:{_short_hash(raw)}"
+    created = int(o.get("created") or 0)
+    updated = int(o.get("updated") or 0)
+    if not created:
+        return f"zhihu:{_short_hash(raw)}"
+    if updated:
+        return f"zhihu:{created}_{updated}_{_short_hash(raw)}"
+    return f"zhihu:{created}_{_short_hash(raw)}"
 
 
 @register
@@ -447,7 +460,13 @@ class ZhihuProvider(Provider):
             author=o.get("author", ""),
             published=published,
             content="".join(parts),
-            extra={"type": o.get("target_type", ""), "verb": o.get("verb", "")},
+            extra={
+                "type": o.get("target_type", ""),
+                "verb": o.get("verb", ""),
+                # 内容的当前版本（0 = 这个类型拿不到）。id 和「旧版本该不该清掉」
+                # 都靠它判断，见 _item_id / _identity。
+                "updated": int(o.get("updated") or 0),
+            },
         )
 
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
@@ -463,10 +482,52 @@ class ZhihuProvider(Provider):
                 seen=self.seen_content,
                 memory_days=self.opt("dedupe_memory_days", 45),
                 on_drop=self.note_drop,
+                # 被新版本取代的旧版本不要再拦新版本（见 _dedupe_by_content）
+                superseded=self.superseded_ids,
             )
         if self.opt("fulltext", True):
             items = self._enrich_fulltext(items, bridge)
         return items
+
+    # ---------- 编辑 ----------
+
+    def prune_superseded(self, items: list[Item]) -> list[Item]:
+        """丢掉被新版本取代的旧条目。
+
+        动态接口只返回内容的**当前版本**（带 updated），所以一条回答被编辑之后，
+        state 里那份旧版本再也不会被刷新 —— 标题和链接还跟新版本一模一样，
+        留着只会白占 history 的位置、在 RSS 里显示成一条重复条目。
+
+        判据是「同一条内容的身份」（见 `_identity`）里 updated 最大的那份才留。
+        同身份的其它条目分两种，都丢：
+
+        - 手里有 updated 但更小的：真·旧版本；
+        - 手里没有 updated 的：加这个字段之前存下来的条目。同身份既然已经有当前
+          版本，它多半就是那条的历史遗留（id 形式换过），一并清掉。
+
+        问题类动态的 target 本来就不带 updated，取到 0，不会命中，原样保留。
+        """
+        newest: dict[tuple[str, str], int] = {}
+        for item in items:
+            key = _identity(item)
+            updated = int(item.extra.get("updated") or 0)
+            if key and updated > newest.get(key, 0):
+                newest[key] = updated
+        if not newest:
+            return items
+
+        kept: list[Item] = []
+        for item in items:
+            key = _identity(item)
+            top = newest.get(key, 0) if key else 0
+            if top and int(item.extra.get("updated") or 0) < top:
+                self.superseded_ids.add(item.id)
+                continue
+            kept.append(item)
+
+        if self.superseded_ids:
+            print(f"    [编辑] 清掉 {len(self.superseded_ids)} 条被新版本取代的旧条目")
+        return kept
 
     # ---------- 全文 ----------
 
@@ -486,6 +547,15 @@ class ZhihuProvider(Provider):
         for n, item in enumerate(todo, 1):
             item_type = item.extra.get("type", "")
             item_id = _id_from_link(item.link)
+            # 连页面都定位不了的：type 不在选择器表里（知乎又出了新类型），或者根本
+            # 没有链接 / 从链接里取不出 id —— 早期抓下来的条目里有 type、link 都空着的。
+            # 这种重试多少次都一样。直接按「没有正文可抓」记下，别占着每轮的配额，
+            # 也别让它一直挂在「待补 N 篇」里（否则下面那行失败会每轮打一次）。
+            if item_type not in FULLTEXT_SELECTORS or not item_id:
+                item.extra["fulltext"] = True
+                print(f"    [全文] 跳过 {item_type or '(无类型)'} "
+                      f"{item_id or '(无链接)'}：没有可用的页面选择器")
+                continue
             try:
                 # 「添加了问题」这类条目的链接是 api.zhihu.com 的接口地址，
                 # 浏览器要去网页版才有内容（见 _web_link）。
@@ -619,6 +689,28 @@ def _dedup_key(item: Item) -> str | None:
     return key
 
 
+def _identity(item: Item) -> tuple[str, str] | None:
+    """同一条内容的身份：链接 + 动作。
+
+    编辑只会换版本、不会换动词；同一篇回答的「回答了问题 / 收藏了回答」动作不同，
+    本来就是两条动态，所以这对孪生不算同一个身份、不会互相取代。
+    """
+    if not item.link:
+        return None
+    return (item.link, str(item.extra.get("verb") or ""))
+
+
+def _seen_time(value) -> str:
+    """指纹表的值是「首次发布时间|发布它的条目 id」；老格式只有时间。"""
+    return str(value or "").split("|", 1)[0]
+
+
+def _seen_owner(value) -> str:
+    """指纹表里记的发布者（条目 id）；老格式没有记，返回空串。"""
+    raw = str(value or "")
+    return raw.split("|", 1)[1] if "|" in raw else ""
+
+
 def _prune_seen(seen: dict[str, str] | None, memory_days) -> dict[str, str]:
     """丢掉超出保留期的指纹（保留期 0 或负数 = 整份丢掉，即关掉跨窗口去重）。"""
     if not seen or not memory_days or float(memory_days) <= 0:
@@ -627,7 +719,7 @@ def _prune_seen(seen: dict[str, str] | None, memory_days) -> dict[str, str]:
     kept: dict[str, str] = {}
     for key, when in (seen or {}).items():
         try:
-            t = datetime.fromisoformat(str(when))
+            t = datetime.fromisoformat(_seen_time(when))
         except ValueError:
             continue
         if t >= cutoff:
@@ -640,6 +732,7 @@ def _dedupe_by_content(
     seen: dict[str, str] | None = None,
     memory_days=45,
     on_drop=None,
+    superseded: set[str] | None = None,
 ) -> tuple[list[Item], dict[str, str]]:
     """正文相同的只保留一条；并把「这条正文已经发出去过」记进指纹表。
 
@@ -653,15 +746,20 @@ def _dedupe_by_content(
     于是同一篇文章被当成新条目又发了一遍。所以「已经发过哪些正文」得单独记一份，
     存在 state 的 `seen_content` 里，不跟着条目一起裁（见 Store）。
 
-    seen 就是这份指纹表 {指纹: 首次发布时间 ISO}；memory_days 是它的保留期。
+    seen 就是这份指纹表，值是 `首次发布时间|发布它的条目 id`：**必须记下发布者**。
+    只按指纹去拦的话，窗口里那些早就发过、而且还在窗口里的条目，下一轮会全被
+    当成「别人发过的同一份正文」丢掉 —— feed 每轮只剩新冒出来的那几条，越跑越空。
+
     返回（保留的条目, 更新后的指纹表）—— 后者由 cli 交回 Store 落盘。
 
     on_drop(item, reason) 每丢一条调一次，给过滤清单日志用。
+    superseded：本轮刚被新版本取代的旧条目 id（见 ZhihuProvider.prune_superseded）。
     """
     registry = _prune_seen(seen, memory_days)
     now = datetime.now().isoformat(timespec="seconds")
     in_window: set[str] = set()  # 本轮窗口里已经见过的指纹
     published = dict(registry)  # 本轮发出去之后，「已发过」的完整名单
+    superseded = superseded or set()
     kept: list[Item] = []
 
     for item in sorted(items, key=sort_key):
@@ -675,15 +773,22 @@ def _dedupe_by_content(
                 on_drop(item, "正文与另一条重复（dedupe_by_content）")
             continue
         in_window.add(key)
-        if key in registry:
+        first = _seen_time(registry.get(key))
+        owner = _seen_owner(registry.get(key))
+        # 只有「发布者是别人」才拦：发布者就是自己的，说明这条一直在窗口里、
+        # 只是又走了一遍，得留着。老格式没记发布者（owner 为空）拿不准，宁可放行。
+        # superseded 里的是刚被新版本取代的旧版本，它登记的指纹也拦不得 ——
+        # 内容被编辑后新旧两版可能撞同一个指纹（编辑没动开头，摘要不变），
+        # 那时拦下来就等于把新版本吞了。
+        if owner and owner != item.id and owner not in superseded:
             # 双胞胎里已经发过的那条早被裁掉了，只剩这条 —— 别再发一遍
             if on_drop is not None:
                 on_drop(
                     item,
-                    f"正文早先已发布过（首次 {registry[key][:16]}，跨窗口去重）",
+                    f"正文早先已发布过（首次 {first[:16]}，跨窗口去重）",
                 )
             continue
-        published.setdefault(key, now)
+        published[key] = f"{first or now}|{item.id}"
         kept.append(item)
 
     return sorted(kept, key=sort_key, reverse=True), published
