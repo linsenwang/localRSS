@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from .bridge import DEFAULT_URL
+from .bridge import DEFAULT_BROWSER, DEFAULT_URL
 
 
 @dataclass
@@ -37,6 +37,8 @@ class Config:
     bridge_url: str
     session: str
     group_title: str
+    #: 浏览器没窗口（扩展掉线）时自动打开的应用名，空字符串 = 不自动开
+    browser: str
     output_dir: Path
     state_dir: Path
     log_dir: Path
@@ -59,6 +61,13 @@ class Config:
         if missing:
             raise ValueError(f"config 里没有这些源: {', '.join(sorted(missing))}")
         return selected
+
+
+def _browser_name(value) -> str:
+    """config 里的 bridge.browser 归一成应用名；None/false/空串都算「不自动开」。"""
+    if value in (None, False):
+        return ""
+    return str(value).strip()
 
 
 def load_config(path: str | Path) -> Config:
@@ -111,6 +120,8 @@ def load_config(path: str | Path) -> Config:
         bridge_url=bridge_cfg.get("url") or DEFAULT_URL,
         session=bridge_cfg.get("session") or "local-rss",
         group_title=bridge_cfg.get("group_title") or "本地 RSS",
+        # 没写这个键 = 用默认浏览器；显式写成空/false = 关掉自动打开
+        browser=_browser_name(bridge_cfg.get("browser", DEFAULT_BROWSER)),
         output_dir=resolve(output_cfg.get("dir"), "output"),
         state_dir=resolve(output_cfg.get("state_dir"), "state"),
         log_dir=resolve(output_cfg.get("log_dir"), "logs"),

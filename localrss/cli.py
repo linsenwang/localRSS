@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.clean:
-        bridge = Bridge(url=cfg.bridge_url, session=cfg.session)
+        bridge = Bridge(url=cfg.bridge_url, session=cfg.session, browser=cfg.browser)
         try:
             check_bridge(bridge)
         except BridgeError as e:
@@ -256,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
                 failed += 1
         return 1 if failed else 0
 
-    bridge = Bridge(url=cfg.bridge_url, session=cfg.session)
+    bridge = Bridge(url=cfg.bridge_url, session=cfg.session, browser=cfg.browser)
     try:
         check_bridge(bridge)
     except BridgeError as e:

@@ -14,6 +14,10 @@ bridge:
   # 运行结束后关掉本次打开的标签页（只关本 session 的，不动你自己的页面）。
   # 也可以用 `python3 rss.py --keep-tabs` 临时保留。
   close_session: true
+  # 浏览器**没有窗口**时自动打开的应用名（macOS 的 `open -a`）。
+  # 扩展的连接会随最后一个窗口一起消失、且不会自己重连，这时所有抓取都会报
+  # "no extension connected" —— 定时任务最容易踩。留空 = 不自动开，直接报错。
+  browser: Google Chrome
 
 output:
   dir: output          # RSS 文件输出目录（相对本文件所在目录）

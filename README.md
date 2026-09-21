@@ -18,6 +18,9 @@
    ```bash
    ~/.kimi-webbridge/bin/kimi-webbridge status   # 需要 running + extension_connected 均为 true
    ```
+   浏览器**一个窗口都没开**的时候扩展会掉线（浏览器进程还在后台，但扩展不会自己重连）。
+   这种情况脚本会按 `config.yaml` 的 `bridge.browser` 自己开一个窗口再继续，不用手动管，
+   详见[常见问题](#常见问题)。
 2. 在浏览器里**已登录** B 站 / 知乎。
 3. Python 3.10+ 和 PyYAML：
    ```bash
@@ -568,6 +571,7 @@ bridge:
   session: local-rss                    # 标签页所属 session（标签组）
   group_title: 本地 RSS                 # 标签组显示名
   close_session: true                   # 跑完关掉本次打开的标签页
+  browser: Google Chrome                # 浏览器没窗口时自动打开哪个（留空 = 不自动开）
 
 output:
   dir: output        # RSS 输出目录（相对 config.yaml 所在目录）
@@ -1307,6 +1311,14 @@ local_rss/
 ~/.kimi-webbridge/bin/kimi-webbridge start
 ~/.kimi-webbridge/bin/kimi-webbridge status
 ```
+
+如果报的是 `no extension connected` / 「浏览器扩展未连接」，先看浏览器是不是**一个窗口都没开**：
+macOS 上关掉最后一个窗口后浏览器进程还在后台跑，`status` 照样说 `running: true`，
+但扩展的连接跟着窗口一起没了、且不会自己重连 —— 所有抓取都会失败。
+脚本会按 `config.yaml` 的 `bridge.browser`（默认 `Google Chrome`）自动开一个窗口再等它连上，
+所以定时任务不用管；留空则不自动开，直接报错。
+浏览器开着窗口、`status` 里 `extension_connected` 也是 `true` 还失败的话，就是扩展本身的问题
+（没装扩展、被禁用，或换过 daemon 端口后没重新指过来），按上面链接排查。
 
 **抓到的条数为 0，或接口返回异常** — 多半是浏览器里没登录（或被要求验证）。
 打开页面确认一下，登录后重跑即可。

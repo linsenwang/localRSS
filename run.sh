@@ -4,8 +4,9 @@
 # 和直接跑 `python3 rss.py` 的区别：
 #   1. 补上 cron/launchd 里缺失的 PATH
 #   2. 先确认 WebBridge daemon 在跑，没跑就拉起来
-#   3. 浏览器扩展没连上时给出明确原因（而不是一句看不懂的报错）
 #
+# 浏览器没窗口（扩展会掉线）不在这里管 —— rss.py 的 check_bridge 会按
+# config.yaml 的 bridge.browser 自己把窗口开出来。
 # 标签页清理由 rss.py 自己负责（结束时 close_session），这里不用管。
 
 set -uo pipefail
@@ -48,10 +49,8 @@ ensure_webbridge() {
     log "错误：WebBridge daemon 启动失败"
     return 1
   fi
-  if ! printf '%s' "$status" | grep -q '"extension_connected":true'; then
-    log "错误：浏览器扩展未连接 —— 浏览器没打开，或扩展未启用"
-    return 1
-  fi
+  # 扩展没连上不在这里拦：浏览器没窗口时扩展会掉线，rss.py 会自己开窗口再等它连上
+  # （见 config.yaml 的 bridge.browser）。在这里拦住等于不给它修的机会。
   return 0
 }
 
