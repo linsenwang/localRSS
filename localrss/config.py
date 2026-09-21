@@ -49,6 +49,8 @@ class Config:
     exclude_keywords: list[str]
     #: 把每轮被过滤掉的条目写一份清单（logs/<feed-id>.dropped.log，覆盖写）
     dropped_log: bool
+    #: 抓完有新内容时发一条 macOS 通知（osascript）
+    notify: bool
     feeds: list[FeedConfig]
 
     def enabled_feeds(self, only: list[str] | None = None) -> list[FeedConfig]:
@@ -130,6 +132,8 @@ def load_config(path: str | Path) -> Config:
         hub_url=str(output_cfg.get("hub_url") or "").rstrip("/"),
         close_session=bool(bridge_cfg.get("close_session", True)),
         dropped_log=bool(output_cfg.get("dropped_log", False)),
+        # 没写这个键 = 开（抓完有新内容就提醒），写 false 才关
+        notify=bool(output_cfg.get("notify", True)),
         exclude_keywords=[
             str(k) for k in (raw.get("exclude_keywords") or []) if str(k).strip()
         ],

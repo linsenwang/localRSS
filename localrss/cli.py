@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import feed as feed_mod
+from . import notify
 from . import providers
 from . import websub
 from .bridge import Bridge, BridgeError, check_bridge
@@ -266,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     close_tabs = cfg.close_session and not args.keep_tabs
     failed = 0
     interrupted = False
+    #: 本轮有新内容的源，抓完汇总成一条 macOS 通知（见文件末尾）
+    news: list[str] = []
     try:
         for feed_cfg in feeds:
             try:
@@ -280,8 +283,16 @@ def main(argv: list[str] | None = None) -> int:
                 # 没有新内容那种常见运行就不打扰它了（通知失败不影响抓取结果）。
                 # derived：本轮没抓到新动态，但 postprocess 自己造了条目（比如攒够
                 # 或过期后兜底合成的图片合集），RSS 也确实变了，同样要通知。
-                if r["added"] or r["derived"]:
+                new_count = r["added"] + r["derived"]
+                if new_count:
                     _notify_hub(feed_cfg, cfg)
+                    # 通知里报的是「新增」；只有合集是 postprocess 自己造的
+                    # （没抓到新动态、但 RSS 确实多了内容）时才报合集数
+                    name = feed_cfg.title or feed_cfg.id
+                    news.append(
+                        f"{name} +{r['added']}" if r["added"]
+                        else f"{name} 合集 +{r['derived']}"
+                    )
             except Exception as e:
                 failed += 1
                 print(f"[{feed_cfg.id}] 失败: {e}", file=sys.stderr)
@@ -303,6 +314,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if interrupted:
         return 130
+    # 有新内容就发一条 macOS 通知（桌面上一眼看到，不用翻日志）。
+    # 汇总成一条：五个源各发一条会刷屏。中断的那次不发 —— 结果不完整。
+    if cfg.notify and news:
+        subtitle = f"{len(news)} 个源有新内容"
+        body = " · ".join(news)
+        if notify.send("local_rss", body, subtitle):
+            print(f"[通知] 已弹出 macOS 通知：{subtitle}（{body}）")
     return 1 if failed else 0
 
 

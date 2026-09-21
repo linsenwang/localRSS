@@ -50,6 +50,13 @@ python3 rss.py --list-types    # 列出已支持的站点类型
 - 之后是增量的：从第 1 页开始，**整页都是已有记录就停止翻页**，通常几秒钟结束。
 - 抓取时会在浏览器里打开对应页面（归在 `bridge.group_title` 这个标签组下），
   跑完会自动关掉，详见[标签页清理](#标签页清理)。
+- 真的有新条目时，最后会弹一条 macOS 通知（多个源汇总成一条）：
+
+  ```
+  [通知] 已弹出 macOS 通知：2 个源有新内容（bilibili +5 · nell +1）
+  ```
+
+  没有新内容的那种常见运行不打扰你。不想要的话把 `output.notify` 写成 `false`。
 
 ## 手动操作：main.sh
 
@@ -578,6 +585,7 @@ output:
   state_dir: state   # 去重/增量用的状态目录
   log_dir: logs      # 过滤清单的目录（见下面的 dropped_log）
   dropped_log: true  # 每轮把被过滤掉的条目写成 <log_dir>/<feed-id>.dropped.log（覆盖写）
+  notify: true       # 有新内容时弹一条 macOS 通知（多个源汇总成一条）
   history: 150       # 每个源最多保留多少条（可被各 feed 的 history 覆盖）
   base_url: ""       # 可选，服务地址前缀（开了 WebSub 后就是 hub 抓 feed 用的那个地址）
   hub_url: ""        # 可选，WebSub hub 地址；留空 = 关闭（见「WebSub」一节）
@@ -1291,6 +1299,7 @@ local_rss/
 │   ├── store.py             # 状态与去重
 │   ├── feed.py              # RSS 2.0 生成（含 rel="hub" 声明）
 │   ├── websub.py            # WebSub 发布端：内容更新后 ping hub
+│   ├── notify.py            # macOS 通知（有新内容时弹一条）
 │   ├── hub.py               # 自用的极简 WebSub hub（纯标准库）
 │   ├── cli.py               # 命令行逻辑
 │   └── providers/
@@ -1319,6 +1328,13 @@ macOS 上关掉最后一个窗口后浏览器进程还在后台跑，`status` �
 所以定时任务不用管；留空则不自动开，直接报错。
 浏览器开着窗口、`status` 里 `extension_connected` 也是 `true` 还失败的话，就是扩展本身的问题
 （没装扩展、被禁用，或换过 daemon 端口后没重新指过来），按上面链接排查。
+
+**没收到 macOS 通知** — 先看日志里有没有 `[通知] 已弹出 macOS 通知` 这一行：
+
+- 没有这一行：本轮确实没有新条目（只有真有新增才发），或者 `output.notify` 被关了。
+- 有这一行但还是没看到横幅：多半是系统的**专注模式/勿扰**挡掉了，去
+  「系统设置 → 通知」里把 `osascript`（脚本编辑器）的通知权限打开。
+  通知只是锦上添花，发不出去不影响抓取 —— 日志里那行 `[通知]` 就是它的成功标记。
 
 **抓到的条数为 0，或接口返回异常** — 多半是浏览器里没登录（或被要求验证）。
 打开页面确认一下，登录后重跑即可。
