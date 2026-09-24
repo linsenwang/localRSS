@@ -100,7 +100,10 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
                   history=feed_cfg.history or cfg.history)
     # --force：假装本地什么都没有，翻满 max_pages 重抓一遍。
     # 但仍然合并进原有 state（不是清空），所以知乎全文这类补全过的内容不会丢。
-    known = set() if force else store.known_ids()
+    # before_ids 是本轮之前 state 里已有的 id，用来算「筛选之后真正新增了几条」
+    # （见下面 new_visible）—— force 时也要留着，不然通知里会谎报全量。
+    before_ids = store.known_ids()
+    known = set() if force else before_ids
 
     items = provider.fetch(bridge, known)
     merged, added = store.merge(items)
@@ -119,6 +122,11 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
     # 「过滤掉」只算真被规则丢掉的：被收进图片合集的条数不单条出现，但不是丢了信息
     grouped = provider.grouped_items
     dropped = len(merged) - len(visible) - grouped
+
+    # 通知里要报的数字：筛选/合集之后**真正进了 RSS 的新条目数**。
+    # 不能拿 added（那是抓到的原始条数）：被关键词过滤掉的不算，被并进合集的
+    # 单条也不单算（合集自己是一条新条目，会正常算进来）。
+    new_visible = sum(1 for item in visible if item.id not in before_ids)
 
     # 过滤清单：丢了哪些、为什么丢，写一份到 logs/<id>.dropped.log（覆盖写）。
     # 这份文件只为人看，跟 RSS/state 无关，失败也不该让整轮算失败。
@@ -157,6 +165,7 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
         "path": str(output_path),
         "total": len(visible),
         "added": added,
+        "new_visible": new_visible,
         "dropped": dropped,
         "grouped": grouped,
         "derived": provider.derived_items,
@@ -286,13 +295,11 @@ def main(argv: list[str] | None = None) -> int:
                 new_count = r["added"] + r["derived"]
                 if new_count:
                     _notify_hub(feed_cfg, cfg)
-                    # 通知里报的是「新增」；只有合集是 postprocess 自己造的
-                    # （没抓到新动态、但 RSS 确实多了内容）时才报合集数
-                    name = feed_cfg.title or feed_cfg.id
-                    news.append(
-                        f"{name} +{r['added']}" if r["added"]
-                        else f"{name} 合集 +{r['derived']}"
-                    )
+                    # 通知里报的是筛选/合集之后真正进 RSS 的条数（new_visible），
+                    # 不是抓到的原始条数（added）—— 上面那行「新增」是原始条数
+                    if r["new_visible"]:
+                        name = feed_cfg.title or feed_cfg.id
+                        news.append(f"{name} +{r['new_visible']}")
             except Exception as e:
                 failed += 1
                 print(f"[{feed_cfg.id}] 失败: {e}", file=sys.stderr)
