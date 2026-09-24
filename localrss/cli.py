@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -13,11 +14,54 @@ from . import feed as feed_mod
 from . import notify
 from . import providers
 from . import websub
-from .bridge import Bridge, BridgeError, check_bridge
+from .bridge import Bridge, BridgeError, StopRequested, check_bridge
 from .config import Config, load_config
 from .store import Store
 
 DEFAULT_CONFIG = "config.yaml"
+
+
+def _setup_signals(stop: threading.Event) -> None:
+    """SIGINT/SIGTERM → 先记个标记，等当前这次 WebBridge 调用收尾再退出。
+
+    不直接在 handler 里抛 KeyboardInterrupt，是因为信号往往正好打在某个调用
+    中途（定时任务最明显：pm2 的 cron_restart 正好在进程刚起来那一下发信号）。
+    那次调用被丢下不管，浏览器那边照样会把标签页开出来，但 daemon 没把它记进
+    session —— close_session 之后永远够不着，就成了得手动关的残留页面。
+    详见 README「标签页清理」。
+
+    连发两次信号才强制退出（恢复系统默认行为），免得哪次调用真卡住时杀不掉。
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def handler(signum, _frame):
+        if stop.is_set():
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        stop.set()
+        print(
+            f"[停止] 收到信号 {signum}：等当前这步 WebBridge 调用做完就收尾"
+            "（再发一次信号可立即强制退出）",
+            file=sys.stderr,
+        )
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, handler)
+
+
+def _mute_signals() -> None:
+    """收尾期间忽略 SIGINT/SIGTERM：清理就几秒，不能被第二个信号打断（标签页会漏）。"""
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+
+
+def _tab_label(tab: dict) -> str:
+    """标签页在日志里怎么显示：优先 URL，没有就退到标题。"""
+    return str(tab.get("url") or tab.get("title") or "?")
 
 
 def _feed_url(cfg: Config, feed_cfg) -> str:
@@ -204,10 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # 关机 / pm2 stop / kill 默认发 SIGTERM，Python 默认会直接终止、
-    # 不执行 finally，标签页就漏了。转成 KeyboardInterrupt 走统一的清理路径。
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    # 停止信号先只置位，等当前这次 WebBridge 调用收尾再中断（见 _setup_signals）。
+    stop = threading.Event()
+    _setup_signals(stop)
 
     if args.list_types:
         for name, cls in sorted(providers.available_types().items()):
@@ -227,14 +270,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.clean:
-        bridge = Bridge(url=cfg.bridge_url, session=cfg.session, browser=cfg.browser)
+        bridge = Bridge(
+            url=cfg.bridge_url, session=cfg.session, browser=cfg.browser,
+            stop=stop.is_set,
+        )
         try:
             check_bridge(bridge)
         except BridgeError as e:
             print(str(e), file=sys.stderr)
             return 3
-        closed = bridge.close_session()
+        except StopRequested:
+            print("[停止] 清理刚开始就被中断信号打断，本次什么也没关。", file=sys.stderr)
+            return 130
+        closed, left = bridge.close_session()
         print(f"[清理] session {cfg.session!r} 关闭了 {closed} 个标签页")
+        # 关不掉的（没记进 session 的孤儿标签页）得让用户知道，别以为清干净了
+        for tab in left:
+            print(f"[清理] 没关掉，需要手动关：{_tab_label(tab)}", file=sys.stderr)
         return 0
 
     try:
@@ -266,12 +318,18 @@ def main(argv: list[str] | None = None) -> int:
                 failed += 1
         return 1 if failed else 0
 
-    bridge = Bridge(url=cfg.bridge_url, session=cfg.session, browser=cfg.browser)
+    bridge = Bridge(
+        url=cfg.bridge_url, session=cfg.session, browser=cfg.browser,
+        stop=stop.is_set,
+    )
     try:
         check_bridge(bridge)
     except BridgeError as e:
         print(str(e), file=sys.stderr)
         return 3
+    except StopRequested:
+        print("[停止] 启动阶段收到停止信号，本次不抓取。", file=sys.stderr)
+        return 130
 
     close_tabs = cfg.close_session and not args.keep_tabs
     failed = 0
@@ -280,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
     news: list[str] = []
     try:
         for feed_cfg in feeds:
+            # 停止信号在两次调用之间生效：要么整源跳过，要么由 bridge 在源内部抛出
+            if stop.is_set():
+                raise StopRequested()
             try:
                 r = _run_feed(feed_cfg, cfg, bridge, force=args.force)
                 notes = f"，过滤掉 {r['dropped']} 条" if r["dropped"] else ""
@@ -300,24 +361,33 @@ def main(argv: list[str] | None = None) -> int:
                     if r["new_visible"]:
                         name = feed_cfg.title or feed_cfg.id
                         news.append(f"{name} +{r['new_visible']}")
+            except StopRequested:
+                raise
             except Exception as e:
                 failed += 1
                 print(f"[{feed_cfg.id}] 失败: {e}", file=sys.stderr)
-    except KeyboardInterrupt:
-        # 被 pm2 restart / Ctrl-C 打断（关机、手动重跑等）：不打 traceback 污染日志，
-        # 但仍然走下面的清理。
+    except (KeyboardInterrupt, StopRequested):
+        # 被 pm2 cron_restart / Ctrl-C / kill 打断（关机、手动重跑等）：不打 traceback
+        # 污染日志，但仍然走下面的清理。KeyboardInterrupt 还留着兜底 —— 信号 handler
+        # 之外（比如非主线程）抛出来的中断也得收干净。
         interrupted = True
         print("[中断] 收到停止信号，正在清理本次打开的标签页...", file=sys.stderr)
     finally:
         # 收尾：只关掉本 session（本次运行）打开的标签页，用户自己的页面不受影响；
-        # daemon 不在线时静默跳过。清理期间再收到信号也照做（吞掉，别让 finally 中途退出）。
+        # daemon 不在线时静默跳过。清理期间忽略信号 —— 第二个信号（pm2 等不及时的
+        # SIGKILL 之前那一发）不该把清理打断，否则标签页就漏在浏览器里了。
         if close_tabs:
+            _mute_signals()
             try:
-                closed = bridge.close_session()
-            except BaseException:
-                closed = 0
+                closed, left = bridge.close_session()
+            finally:
+                # 收完把 handler 装回去：此时 stop 已置位，再收到信号就是强制退出 ——
+                # 别让后面发通知（osascript，最长 15s）这段没人杀得动。
+                _setup_signals(stop)
             if closed:
                 print(f"[清理] 已关闭本次打开的 {closed} 个浏览器标签页")
+            for tab in left:
+                print(f"[清理] 没关掉，需要手动关：{_tab_label(tab)}", file=sys.stderr)
 
     if interrupted:
         return 130

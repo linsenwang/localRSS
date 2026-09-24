@@ -24,6 +24,13 @@ class BridgeError(RuntimeError):
     """WebBridge 调用失败。"""
 
 
+class StopRequested(RuntimeError):
+    """收到停止信号，且此刻不在 WebBridge 调用中途 —— 可以安全地中断。
+
+    由 Bridge 在「下一次调用开工之前」抛出，见 Bridge.try_call。
+    """
+
+
 class Bridge:
     def __init__(
         self,
@@ -31,17 +38,29 @@ class Bridge:
         session: str = "local-rss",
         timeout: int = 120,
         browser: str = "",
+        stop=None,
     ):
         self.url = url
         self.session = session
         self.timeout = timeout
         #: 浏览器没窗口（扩展掉线）时自动打开的应用名，空字符串 = 不自动开
         self.browser = browser
+        #: 返回 True = 该收工了（定时任务收到 SIGINT/SIGTERM 时置位）。
+        #: 只在调用**开工前**检查它，这样已经发出去的调用能正常收尾，见 try_call。
+        self.stop = stop
+        #: 收尾阶段（close_session）置位：这时候的调用必须发出去，不再看停止标志
+        self.cleaning = False
 
     # ---------- 底层调用 ----------
 
     def try_call(self, action: str, args: dict | None = None) -> dict | None:
-        """调用失败（含浏览器侧报错）返回 None。"""
+        """调用失败（含浏览器侧报错）返回 None；该停手了则抛 StopRequested。"""
+        # 停止信号只在**调用与调用之间**生效：已经发出去的调用必须等它回来。
+        # 半路把调用丢下不管的话，浏览器那边照样会把标签页开出来，但 daemon
+        # 没把它记进 session —— 之后 close_session 永远够不着，就成了手动才能
+        # 关掉的残留页面（复现过程见 README「标签页清理」）。
+        if not self.cleaning and self.stop is not None and self.stop():
+            raise StopRequested()
         payload = json.dumps(
             {"action": action, "args": args or {}, "session": self.session}
         ).encode("utf-8")
@@ -142,16 +161,33 @@ class Bridge:
         """
         return self.evaluate(code) or {"ok": False, "error": "空返回"}
 
-    def close_session(self) -> int:
-        """关掉本 session 打开的全部标签页（不影响用户自己的标签）。
+    def close_session(
+        self, verify_attempts: int = 3, delay_s: float = 2.0
+    ) -> tuple[int, list[dict]]:
+        """关掉本 session 打开的全部标签页（不影响用户自己的标签），并回读确认。
 
-        daemon 不在线时静默跳过，返回被关闭的数量。
+        返回 (关掉的数量, 回读时还挂着的标签页)。daemon 不在线时静默跳过，返回 (0, [])。
+
+        收尾专用，比「关一次就走」多做两件事：
+          * 置上 cleaning，让收尾期间的调用不受停止信号影响；
+          * 关完用 list_tabs 回读，还有剩的就隔 delay_s 再来一遍 —— 刚被打断的
+            那次调用可能才刚落进 session。注意 daemon 这个接口看不见**没记进
+            session 的孤儿标签页**，那种只能手动关。
         """
-        try:
-            data = self.try_call("close_session")
-        except BridgeError:
-            return 0
-        return int((data or {}).get("closed") or 0)
+        self.cleaning = True
+        closed = 0
+        left: list[dict] = []
+        for attempt in range(1, verify_attempts + 1):
+            try:
+                data = self.try_call("close_session")
+                closed += int((data or {}).get("closed") or 0)
+                left = list((self.try_call("list_tabs") or {}).get("tabs") or [])
+            except BridgeError:
+                return closed, left
+            if not left or attempt == verify_attempts:
+                break
+            time.sleep(delay_s)
+        return closed, left
 
 
 def check_bridge(bridge: Bridge) -> None:

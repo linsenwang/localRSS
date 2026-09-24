@@ -5,7 +5,8 @@
 #   ./main.sh force              强制刷新：忽略增量缓存，翻满 max_pages 重抓重渲
 #   ./main.sh zhihu-kvxjr369f    只跑指定源（缺省跑 config.yaml 里全部启用的源）
 #   ./main.sh force bilibili-follow   两者组合
-#   ./main.sh clean              关掉遗留的浏览器标签页（进程被 kill -9 后可能残留）
+#   ./main.sh clean              关掉 session 里遗留的浏览器标签页
+#                                （daemon 没登记上的孤儿标签它够不着，只能手动在浏览器里关）
 #   ./main.sh ping [源]          只 ping hub 通知有更新（不抓取，用来验证 hub 链路）
 #   ./main.sh status             看 pm2 进程 / 订阅地址 / 数据概览
 #   ./main.sh log [行数]         看最近抓取日志（默认 20 行）

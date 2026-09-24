@@ -437,32 +437,69 @@ pm2 logs local-rss-hub               # hub 侧的验签 / 抓取 / 推送全过�
 脚本从不复用你手开的页面（`find_tab` 默认只在本 session 内查找，也不会借用你当前正在看的标签页），
 只用 `newTab` 新开自己的；收尾的 `close_session` 也只清空本 session 的标签组。
 
-### 什么时候会漏
+### 什么时候会漏：信号正好打在「新开标签页」那一下
 
 清理挂在 `finally` 上，所以正常退出、报错、`Ctrl-C`、`pm2 stop/restart`（发 SIGINT）都会走到。
-**但 SIGTERM 是个坑**：Python 默认收到 SIGTERM 会直接终止，`finally` 根本不执行。
-关机、`kill <pid>`、launchd 停服务走的都是 SIGTERM。
+（SIGTERM 也接了同一个 handler —— 关机、`kill <pid>`、launchd 停服务走的都是它，Python 默认
+收到就直接终止，`finally` 根本不执行。）
 
-已修：脚本启动时装了 SIGTERM handler，转成中断信号走同一条清理路径。
+**但信号打在某个 WebBridge 调用中途时会漏**：老写法在 handler 里直接抛 `KeyboardInterrupt`，
+那次调用就被丢下不管了 —— 浏览器那边照样把标签页开出来，可 daemon 没来得及把它记进
+session，之后 `close_session` 永远够不着，它就成了只能手动关的残留页面。
+
+实测最容易踩的是 B 站，原因有二：
+
+1. `bilibili-follow` 是配置里的第一个源，每次运行新开的第一个标签页就是 `t.bilibili.com`；
+   而 pm2 的 `cron_restart` 正好在进程刚起来那一下发信号，撞上「正在新开标签页」的窗口多半落在这里。
+2. 后面的标签页还有个 opener 指向 session 内的标签页，daemon 能按它认领回来
+   （日志里的 `[session] local-rss: adopted tab … as borrowed`）；第一个标签页没有，认都认不回来。
+
+复现（修复前的代码，看到「打开页面」后 0.25s 发信号）：
+
+```bash
+python3 -u rss.py bilibili-follow &     # -u：否则「打开页面」要等进程退出才落进文件
+# 等它打出「[bilibili-follow] 打开页面 https://t.bilibili.com/」之后：
+kill -TERM %1
+# [中断] 收到停止信号，正在清理本次打开的标签页...   ← 没有「已关闭」那行，说明一个都没关掉
+```
+
+结果 `https://t.bilibili.com/` 就留在浏览器里了，`list_tabs` 看不到、`close_session` 也关不掉：
+
+```bash
+python3 rss.py --clean
+# [清理] session 'local-rss' 关闭了 0 个标签页
+```
+
+**已修**（`cli._setup_signals` + `bridge.Bridge.try_call`）：信号先只置个标记，等当前这次调用
+正常返回、**下一个调用开工之前**才中断。这样标签页该登记的都登记进 session 了，收尾的
+`close_session` 就关得掉。连发两次信号才强制退出（哪次调用真卡住时仍然杀得掉），收尾期间
+忽略信号 —— 免得第二个信号把清理本身打断。同一个注入再跑一遍：
 
 ```
-# 对照实验（不加 handler 的情况）
-kimi$ python3 sigdemo.py & sleep 0.5; kill $!
-exit = -15        # 直接死掉，finally 里的清理被跳过
+[停止] 收到信号 15：等当前这步 WebBridge 调用做完就收尾（再发一次信号可立即强制退出）
+[中断] 收到停止信号，正在清理本次打开的标签页...
+[清理] 已关闭本次打开的 1 个浏览器标签页
+```
+
+配套改的是 `ecosystem.config.js` 里的 `kill_timeout: 60000`：pm2 发完信号默认只等 1.6s 就
+SIGKILL，会把「做完当前调用再收尾」这一下砍在半路。改完要让 pm2 重读配置：
+
+```bash
+pm2 start ecosystem.config.js --only local-rss
 ```
 
 ### 手动兜底
 
-漏了（比如进程被 `kill -9`）跑一条命令就能清掉本 session 的残留：
+跑一条命令清掉本 session 里登记的残留：
 
 ```bash
 python3 rss.py --clean
 # [清理] session 'local-rss' 关闭了 2 个标签页
 ```
 
-注意它只能清掉 **daemon 还记得的** 标签页。如果浏览器扩展在中途重载/重启过，
-session→tab 的映射会丢，那些标签对 daemon 来说就成了孤儿，`list_tabs` 看不到、
-`close_session` 也够不着 —— 只能手动在浏览器里关掉。
+但它只能清掉 **daemon 还记得的** 标签页。浏览器扩展中途重载/重启过、或者调用被砍在半路
+没能登记的，对 daemon 来说就是孤儿：`list_tabs` 看不到、`close_session` 也够不着，只能手动
+在浏览器里关掉（`--clean` 会把「session 里还挂着、但没关掉」的打出来，孤儿它同样看不到）。
 
 想保留标签页方便调试：
 
@@ -1344,6 +1381,11 @@ macOS 上关掉最后一个窗口后浏览器进程还在后台跑，`status` �
 等几分钟再跑即可，长期就把 `cron_restart` 调到 30 分钟以上。
 
 **跑完 `pm2 list` 显示 `stopped`** — 正常。这是一次性脚本，跑完就该退出，到点会自己再跑。
+
+**浏览器里一直挂着一个 `t.bilibili.com` 标签页关不掉** — 见上面的[标签页清理](#标签页清理)：
+停止信号正好打在「新开标签页」那一下时，那次调用被丢下不管，标签页就没登记进 session，
+之后 `close_session` 够不着它，只能手动关。代码里已修（信号改成「做完当前这次调用再退」），
+新开的不再漏；已经残留的那个只能自己关掉。
 
 **加了关键词但没看到条数变化** — 说明当前抓取窗口（`max_pages` 覆盖的范围）里还没有命中这些关键词的条目。
 过滤是对已抓到的条目生效的，命中要等这些内容真的出现在动态流里。
