@@ -1,7 +1,9 @@
-"""知乎动态 provider。
+"""知乎 provider，两种 mode：
 
-对应 https://www.zhihu.com/people/<token> 的「动态」页，
-直接调用 api/v3/moments/<token>/activities，在浏览器里带 cookie 请求。
+- `activities`（默认）：https://www.zhihu.com/people/<token> 的「动态」页，
+  直接调用 api/v3/moments/<token>/activities，在浏览器里带 cookie 请求；
+- `notifications`：https://www.zhihu.com/notifications 通知中心，
+  调用 api/v4/notifications/v2/recent（见下）。
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from ..bridge import Bridge
 from ..models import Item, sort_key
@@ -23,6 +25,38 @@ from .base import Provider, retry_call
 
 API = "https://www.zhihu.com/api/v3/moments/{token}/activities"
 PROFILE = "https://www.zhihu.com/people/{token}"
+
+# ---------- 通知中心 ----------
+#
+# https://www.zhihu.com/notifications 就是「通知中心」：谁回复/评论了你、
+# 谁赞同喜欢了你、谁关注了你、以及各种邀请和站务通知。页面自己也调这个接口：
+#
+#   api/v4/notifications/v2/recent?limit=20&offset=0&entry_name=all
+#
+# offset 是个**时间戳**（上一页最后一条的 create_time），不是页码——
+# 接口在 paging.next 里回下一个地址，照它翻就行。注意它给的是 http:// 的地址，
+# 在 https 页面里 fetch 会被当混合内容拦掉，所以下面统一改回 https。
+MODE_ACTIVITIES = "activities"
+MODE_NOTIFICATIONS = "notifications"
+MODES = (MODE_ACTIVITIES, MODE_NOTIFICATIONS)
+
+NOTIFICATIONS_PAGE = "https://www.zhihu.com/notifications"
+NOTIFICATIONS_API = "https://www.zhihu.com/api/v4/notifications/v2/recent"
+
+#: 通知分类（接口的 entry_name）。名字和页面 JS 里的映射表一一对应，
+#: 页面上那几个 tab（全部通知 / 关注我的 / 赞同与喜欢 / …）就是它。
+#: **写错了接口不会报错，只会静默返回空列表**，所以这里先校验一遍。
+NOTIFICATION_ENTRIES = {
+    "all": "全部通知",
+    "follow": "关注我的",
+    "like": "赞同与喜欢",
+    "comment": "评论与回复",
+    "mention": "提到我的",
+    "invite": "邀请",
+    "community": "站务通知",
+    "system": "系统通知",
+    "follow_question_add_answer": "关注的问题",
+}
 
 VERB_ACTIONS = {
     "MEMBER_ANSWER_QUESTION": "回答了问题",
@@ -86,6 +120,54 @@ EXTRACT_JS = r"""
       link: t.url || '',
       question_id: q.id || '',
       author: (t.author && t.author.name) || (a.actor && a.actor.name) || ''
+    };
+  }
+})()
+"""
+
+# 通知中心的列表接口。返回的字段和动态那边完全不同，所以在浏览器里就压平成
+# 一条只带展示所需字段的扁平结构（原始数据一条好几 KB，整个搬回来太重）。
+NOTIFICATIONS_EXTRACT_JS = r"""
+(async () => {
+  try {
+    const r = await fetch('__URL__', { credentials: 'include' });
+    const j = await r.json();
+    if (!j.data) {
+      const msg = (j.error && j.error.message) || ('HTTP ' + r.status);
+      return { ok: false, error: msg };
+    }
+    const p = j.paging || {};
+    return { ok: true, is_end: !!p.is_end, next: p.next || null, items: j.data.map(pack) };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+
+  // actors 可能是单个对象（一位发起人）也可能是数组（合并通知：多人点赞）。
+  // name 带「（作者）」后缀，是平台自己标的，保留。
+  function actorName(a) {
+    if (!a) return '';
+    if (Array.isArray(a)) {
+      return a.map(function (x) { return (x && x.name) || ''; }).filter(Boolean).join('、');
+    }
+    return a.name || a.url_token || '';
+  }
+
+  function pack(n) {
+    const c = n.content || {};
+    const t = c.target || {};
+    const ext = c.extend || {};
+    return {
+      id: n.id || '',
+      verb: c.verb || '',
+      created: n.create_time || 0,
+      merge_count: n.merge_count || 0,
+      actor: actorName(c.actors),
+      // 通知指向的内容（问题标题、回答标题…）。内容被删掉时是「该内容被删除」，
+      // link 为空 —— 那种退回通知中心页面（见 _notification_link）。
+      target_text: t.text || '',
+      target_link: t.link || '',
+      // 回复/评论的正文；「喜欢」「关注」这类没有正文，是空串
+      text: typeof ext.text === 'string' ? ext.text : ''
     };
   }
 })()
@@ -320,16 +402,119 @@ def _strip_noscript(content: str) -> str:
                   flags=re.S | re.I)
 
 
+# ---------- 公式 ----------
+#
+# 正文里的公式是 `<span class="ztext-math" data-tex="...">`：页面上靠 MathJax 在浏览器里
+# 把它渲染成内联 <svg>，而 feed 里是一份死 HTML，两种形态都不行：
+#
+# - 抓的时候 MathJax 还没渲染完（常见）：span 里只剩一段原始 TeX 源码（在
+#   `.math-holder` 里），阅读器拿它当普通文字显示 —— 整篇公式变成
+#   `\mathrm{RCA}_0 \subsetneq \mathrm{WKL}_0 ...` 这种谁也看不懂的东西；
+# - 抓的时候已经渲染完：搬过去的 <svg> 里全是 `<use xlink:href="#E1-...">`，
+#   而那些字形定义在页面别处一个隐藏 <svg> 的 <defs> 里，没跟着搬过来 ——
+#   公式多半渲染成空白。
+#
+# 所以统一换成知乎自己的公式图接口（老版知乎的正文就是这么发图的，
+# `data-eeimg="1"` 是行内、`"2"` 是独立成行的那类）：
+#
+#   <img class="eeimg" src="https://www.zhihu.com/equation?tex=<URL 编码的 TeX>" alt="<TeX>">
+#
+# 实测这个接口不要 cookie、不看 Referer，返回的 SVG 字形定义全在同一个文件里，
+# 阅读器直接取就能画。alt 留原始 TeX：图片挂了或者阅读器不显示图片时至少还认得出。
+_MATH_SPAN_OPEN_RE = re.compile(
+    r'<span\b[^>]*class="[^"]*\bztext-math\b[^"]*"[^>]*>', re.I
+)
+_MATH_TEX_ATTR_RE = re.compile(r'data-tex="([^"]*)"', re.I)
+_MATH_EEIMG_ATTR_RE = re.compile(r'data-eeimg="\s*(\d+)')
+_MATH_TEX_SCRIPT_RE = re.compile(
+    r'<script\b[^>]*type="\s*math/tex[^"]*"[^>]*>(.*?)</script>', re.S | re.I
+)
+_MATH_HOLDER_RE = re.compile(
+    r'<span\b[^>]*class="[^"]*\bmath-holder\b[^"]*"[^>]*>(.*?)</span>', re.S | re.I
+)
+_EQUATION_BASE = "https://www.zhihu.com/equation?tex="
+_EQUATION_SRC_RE = re.compile(
+    r'src="(?:(?:https?:)?//[^"]*?/equation\?tex=|/equation\?tex=)([^"]*)"', re.I
+)
+
+
+def _matching_span_end(content: str, start: int) -> int:
+    """`start` 是紧跟在 `<span ...>` 之后的位置，返回配平的那个 `</span>` 之后的位置。
+
+    span 里套着 span，正则的 `.*?</span>` 会在第一个 `</span>` 就收手，所以只能数层数。
+    """
+    depth = 1
+    for m in re.finditer(r"</?span\b", content[start:], re.I):
+        if m.group(0).startswith("</"):
+            depth -= 1
+            if depth == 0:
+                gt = content.find(">", start + m.end())
+                return gt + 1 if gt != -1 else len(content)
+        else:
+            depth += 1
+    return len(content)
+
+
+def _absolute_equation_src(content: str) -> str:
+    """公式图地址补成绝对地址：接口给的正文里是 `//www.zhihu.com/equation?...`。"""
+    return _EQUATION_SRC_RE.sub(lambda m: f'src="{_EQUATION_BASE}{m.group(1)}"', content)
+
+
+def _fix_math(content: str) -> str:
+    """把 `ztext-math` 公式换成公式图（见上面那段说明）。幂等，重复跑没有副作用。"""
+    if not content or "ztext-math" not in content:
+        return _absolute_equation_src(content)
+
+    out: list[str] = []
+    pos = 0
+    for m in _MATH_SPAN_OPEN_RE.finditer(content):
+        if m.start() < pos:  # 已经跟着上一个 span 一起处理掉了
+            continue
+        tag = m.group(0)
+        end = _matching_span_end(content, m.end())
+        inner = content[m.end():end]
+
+        tex = _MATH_TEX_ATTR_RE.search(tag)
+        if tex is not None:
+            raw = tex.group(1)
+        else:
+            # 没有 data-tex 的两种老写法：MathJax 的 script，或者兜底文字
+            script = _MATH_TEX_SCRIPT_RE.search(inner)
+            if script is not None:
+                raw = script.group(1)
+            else:
+                holder = _MATH_HOLDER_RE.search(inner)
+                raw = re.sub(r"<[^>]+>", "", holder.group(1)) if holder else None
+
+        out.append(content[pos:m.start()])
+        text = html.unescape(raw).strip() if raw is not None else ""
+        if text:
+            eeimg = _MATH_EEIMG_ATTR_RE.search(tag)
+            src = _EQUATION_BASE + quote(text, safe="")
+            if eeimg is None or eeimg.group(1) == "1":  # 1 = 行内公式
+                src += "&amp;inline=true"
+            alt = html.escape(text, quote=True)
+            out.append(f'<img class="eeimg" src="{src}" alt="{alt}">')
+        else:
+            out.append(content[m.start():end])  # 认不出来，原样留着，别把内容弄丢
+        pos = end
+    out.append(content[pos:])
+    return _absolute_equation_src("".join(out))
+
+
 def _clean_zhihu_html(content: str) -> str:
     """清理知乎 DOM 里的正文 HTML。
 
     主要是图片：知乎是懒加载的，真实地址在 data-original / data-actualsrc 上，
     src 里是个占位图，直接搬过来会全是空白。
+
+    公式要在这里先换掉：下面会把 <script> 整段删掉，公式的 script 就在里面。
     """
     if not content:
         return ""
 
     content = _strip_noscript(content)
+    content = _fix_math(content)
 
     def fix_img(m: re.Match) -> str:
         tag = m.group(0)
@@ -392,15 +577,115 @@ def _item_id(o: dict) -> str:
     return f"zhihu:{created}_{_short_hash(raw)}"
 
 
+def _https(url: str) -> str:
+    """接口给的下一页地址是 http:// 的，在 https 页面里 fetch 会被当混合内容拦掉。"""
+    return "https:" + url[len("http:"):] if url.startswith("http://") else url
+
+
+def _as_block(content: str) -> str:
+    """把一段正文放进 content 时的包装：本身已经是块级元素就别再套 `<p>`。
+
+    通知里那段回复正文有时是纯文本（`自然淘汰不就可以了…`），有时是带 `<p>` 的
+    HTML —— 后者再套一层 `<p>` 就是非法嵌套（`_rebuild_content` 那边同理）。
+    """
+    content = (content or "").strip()
+    if not content:
+        return ""
+    if re.match(r"<(p|div|blockquote|figure|ul|ol|h[1-6])\b", content, re.I):
+        return content
+    return f"<p>{content}</p>"
+
+
+def _notification_link(o: dict) -> str:
+    """通知指向的那个内容的网页地址；没有就退回通知中心页面。
+
+    内容被删除时接口只给一句「该内容被删除」、`link` 是空的 —— 那种至少让条目
+    还能点回通知中心，别留一个空链接。
+    """
+    return _web_link((o.get("target_link") or "").strip()) or NOTIFICATIONS_PAGE
+
+
+def _notification_title(o: dict) -> str:
+    """通知的标题：`谁 + 干了什么 + ：+ 相关内容`。
+
+    动词本身就带了场景（「回复了回答下你的评论」「喜欢了你的评论」），所以动作
+    当标题主体；后面缀上相关内容的标题（问题/文章标题），否则列表里一排
+    「某某 喜欢了你的评论」根本看不出是哪条。
+
+    动词有的以空格开头（邀请那条是「 的提问等你来答」、前面接的就是人名），
+    所以这里先把整串按空白归一化再拼。
+    """
+    head = " ".join(f"{o.get('actor', '')} {o.get('verb', '')}".split())
+    target = " ".join((o.get("target_text") or "").split())
+    if target and target not in head:
+        return f"{head}：{target}" if head else target
+    return head or "通知"
+
+
+def _notification_item(o: dict, entry: str) -> Item:
+    created = int(o.get("created") or 0)
+    published = datetime.fromtimestamp(created) if created else None
+    link = _notification_link(o)
+    verb = " ".join((o.get("verb") or "").split())
+    target_text = (o.get("target_text") or "").strip()
+
+    # 正文结构和动态那边一致：[动作, (正文), (相关内容), 链接]（见 _body_of）。
+    # 动作单独一段是给去重/过滤用的锚点，也省得阅读器列表里只剩标题。
+    parts = [f"<p>{html.escape(verb)}</p>"]
+    body = _as_block(_clean_zhihu_html(o.get("text") or ""))
+    if body:
+        parts.append(body)
+    if target_text:
+        parts.append(f"<p>{html.escape(target_text)}</p>")
+    if link:
+        parts.append(f'<p><a href="{html.escape(link)}">{html.escape(link)}</a></p>')
+
+    return Item(
+        id=f"zhihu-notif:{o.get('id', '')}",
+        title=_notification_title(o),
+        link=link,
+        author=o.get("actor", ""),
+        published=published,
+        content="".join(parts),
+        extra={
+            "kind": "notification",
+            "entry": entry,
+            "verb": o.get("verb", ""),
+            # 平台会把同类通知合并（多人点赞同一条评论就合成一条）。合并之后
+            # 条目的 actors 会变多，但 id 不变 —— 按 id 去重、阅读器不重复提醒，
+            # 代价是已收下的那条不会跟着刷新（见 README「阅读器那一侧的缓存」）。
+            "merge_count": int(o.get("merge_count") or 0),
+        },
+    )
+
+
 @register
 class ZhihuProvider(Provider):
     type = "zhihu"
-    description = "知乎个人主页动态"
+    description = "知乎个人主页动态 / 通知中心（options.mode）"
+
+    @property
+    def mode(self) -> str:
+        mode = str(self.opt("mode", MODE_ACTIVITIES) or MODE_ACTIVITIES).strip()
+        if mode not in MODES:
+            raise ValueError(
+                f"zhihu: 未知的 mode={mode!r}，可选：{'、'.join(MODES)}"
+            )
+        return mode
 
     def page_url(self) -> str:
+        if self.mode == MODE_NOTIFICATIONS:
+            return NOTIFICATIONS_PAGE
         return PROFILE.format(token=self.require("token"))
 
     def fetch(self, bridge: Bridge, known_ids: set[str]) -> list[Item]:
+        if self.mode == MODE_NOTIFICATIONS:
+            return self._fetch_notifications(bridge, known_ids)
+        return self._fetch_activities(bridge, known_ids)
+
+    # ---------- 个人主页动态 ----------
+
+    def _fetch_activities(self, bridge: Bridge, known_ids: set[str]) -> list[Item]:
         max_pages = int(self.opt("max_pages", 5))
         url = API.format(token=self.require("token")) + "?offset=0&page_num=1"
         items: list[Item] = []
@@ -428,12 +713,62 @@ class ZhihuProvider(Provider):
 
         return items
 
-    def _fetch_page(self, bridge: Bridge, url: str, page: int) -> dict:
-        """抓一页动态列表。失败抛异常，由 retry_call 决定要不要重来。"""
-        result = bridge.evaluate(EXTRACT_JS.replace("__URL__", url))
+    # ---------- 通知中心 ----------
+
+    def _fetch_notifications(self, bridge: Bridge, known_ids: set[str]) -> list[Item]:
+        entry = self.entry_name()
+        limit = int(self.opt("limit", 20))
+        max_pages = int(self.opt("max_pages", 5))
+        url = f"{NOTIFICATIONS_API}?limit={limit}&offset=0&entry_name={entry}"
+        items: list[Item] = []
+        attempts = int(self.opt("list_retries", 2)) + 1
+        delay_s = float(self.opt("list_retry_delay_s", 15))
+
+        for page in range(1, max_pages + 1):
+            result = retry_call(
+                lambda u=url, p=page: self._fetch_page(
+                    bridge, u, p, template=NOTIFICATIONS_EXTRACT_JS,
+                ),
+                attempts=attempts, delay_s=delay_s,
+                label=f"知乎通知（{NOTIFICATION_ENTRIES[entry]}）第 {page} 页",
+            )
+
+            raw_items = result.get("items") or []
+            if not raw_items:
+                break
+
+            page_items = [_notification_item(o, entry) for o in raw_items]
+            items.extend(page_items)
+
+            if known_ids and page_items and all(i.id in known_ids for i in page_items):
+                break
+            if result.get("is_end"):
+                break
+            # 接口回的 next 是 http:// 的地址，在 https 页面里 fetch 会被当混合内容
+            # 拦掉（实测直接 Failed to fetch），这里补成 https。
+            next_url = _https(result.get("next") or "")
+            if not next_url or next_url == url:
+                break
+            url = next_url
+
+        return items
+
+    def entry_name(self) -> str:
+        """通知分类（`entry_name`），默认全部通知。"""
+        entry = str(self.opt("entry_name", "all") or "all").strip()
+        if entry not in NOTIFICATION_ENTRIES:
+            known = "、".join(f"{k}（{v}）" for k, v in NOTIFICATION_ENTRIES.items())
+            raise ValueError(f"zhihu: 未知的通知分类 entry_name={entry!r}，可选：{known}")
+        return entry
+
+    def _fetch_page(self, bridge: Bridge, url: str, page: int,
+                    template: str = EXTRACT_JS,
+                    label: str = "知乎动态") -> dict:
+        """抓一页列表。失败抛异常，由 retry_call 决定要不要重来。"""
+        result = bridge.evaluate(template.replace("__URL__", url))
         if not result or not result.get("ok"):
             detail = (result or {}).get("error") or result
-            raise RuntimeError(f"知乎接口返回异常（第 {page} 页）: {detail}")
+            raise RuntimeError(f"知乎接口返回异常（{label}第 {page} 页）: {detail}")
         return result
 
     def _to_item(self, o: dict) -> Item:
@@ -471,6 +806,10 @@ class ZhihuProvider(Provider):
 
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
         items = super().postprocess(items, bridge)
+        if self.mode == MODE_NOTIFICATIONS:
+            # 通知是平台生成的一条条记录：没有正文可补、也没有「同一条内容换个
+            # 动作又出现一次」的孪生（那套去重是给动态流的），所以到这里就够了。
+            return items
         # 存量条目的 content 在抓下来那一刻就存进 state 了，光修抓取逻辑清不掉
         # 里面的 <noscript> 兜底图（这类条目 extra.fulltext 已标记，不会再重抓），
         # 所以每次跑都统一过一遍。幂等，重复跑没有副作用。
@@ -487,6 +826,12 @@ class ZhihuProvider(Provider):
             )
         if self.opt("fulltext", True):
             items = self._enrich_fulltext(items, bridge)
+        # 公式换成公式图（见 _fix_math 的说明）。存量条目和全文一样，改抓取逻辑清不掉
+        # 老内容里的 `ztext-math`，所以每轮统一过一遍，幂等。
+        # 放在最后是有意的：正文指纹按摘要算、算出来就粘住（见 _dedup_key），
+        # 这里动 content 不该影响去重结果。
+        for item in items:
+            item.content = _fix_math(item.content)
         return items
 
     # ---------- 编辑 ----------
@@ -507,6 +852,10 @@ class ZhihuProvider(Provider):
 
         问题类动态的 target 本来就不带 updated，取到 0，不会命中，原样保留。
         """
+        if self.mode == MODE_NOTIFICATIONS:
+            # 通知不带 updated（extra.updated 一律 0），这套「留最新版本」的逻辑
+            # 对它没有意义。
+            return items
         newest: dict[tuple[str, str], int] = {}
         for item in items:
             key = _identity(item)

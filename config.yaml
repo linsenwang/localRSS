@@ -174,6 +174,35 @@ feeds:
     options:
       token: yuhang-liu-34
 
+  # ---- 知乎通知中心（谁回复/评论/赞同了你）----
+  #
+  # 对应 https://www.zhihu.com/notifications。和上面的个人动态不同，这条抓的是
+  # **你自己收到的通知**，所以没有 token，靠 mode 切过去。
+  #   mode: notifications   抓通知中心；不写 mode = 个人主页动态
+  #   entry_name: all       通知分类，就是页面上那几个 tab 的名字：
+  #                           all                        全部通知
+  #                           follow                     关注我的
+  #                           like                       赞同与喜欢
+  #                           comment                    评论与回复
+  #                           mention                    提到我的
+  #                           invite                     邀请
+  #                           community                  站务通知
+  #                           system                     系统通知
+  #                           follow_question_add_answer 关注的问题
+  #                         （名字写错的话接口不报错、只回空列表，所以代码里会先校验）
+  #   max_pages: 5          最多翻几页。offset 按时间走，翻满就到头
+  #   limit: 20             每页条数
+  - id: zhihu-notifications
+    type: zhihu
+    title: 知乎通知
+    description: www.zhihu.com/notifications 通知中心
+    site_url: https://www.zhihu.com/notifications
+    enabled: true
+    history: 150         # 每条就一句动词 + 一段回复正文，很轻
+    options:
+      mode: notifications
+      entry_name: all
+
   # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
   # - id: bilibili-up
   #   type: bilibili

@@ -10,7 +10,7 @@
 | 站点 | `type` | 说明 |
 |------|--------|------|
 | B 站 | `bilibili` | 关注动态（`https://t.bilibili.com/`）或指定 UP 主空间动态 |
-| 知乎 | `zhihu` | 个人主页动态（`https://www.zhihu.com/people/<token>`） |
+| 知乎 | `zhihu` | 个人主页动态（`https://www.zhihu.com/people/<token>`）或通知中心（`https://www.zhihu.com/notifications`） |
 
 ## 前置条件
 
@@ -140,6 +140,7 @@ rm state/*.json && ./main.sh
 | `show_avatar` / `embed_player` | **立即** |
 | `image_digest_size` / `image_digest_max_age_hours` | 下次运行。**正文会跟着重渲染，但已经分好的批次不会重排** —— 要重来就删掉 state 里那些 `extra.kind == "image_digest"` 的条目 |
 | `max_pages` / `fulltext` / `max_fulltext_per_run` | 下次运行 |
+| `mode` / `entry_name` / `limit` / `token` | 下次运行（换 `entry_name` 相当于换一个源，建议连同 `id` 一起改，别让两个分类共用一份 state） |
 | 标题格式、正文结构这类**渲染逻辑**的改动 | 要 `./main.sh force` |
 
 前四类之所以立即生效，是因为它们每次运行都作用在「state 全量条目」上。
@@ -717,14 +718,78 @@ q9adg 房车博主大批消失，床车自驾爆火，二者差距到底有多�
 
 | 键 | 默认 | 说明 |
 |----|------|------|
-| `token` | — | 主页 URL 里的 token，如 `https://www.zhihu.com/people/kvxjr369f` → `kvxjr369f` |
+| `mode` | `activities` | `activities`：个人主页动态（用 `token`）；`notifications`：通知中心（不用 `token`，见「zhihu · 通知中心」） |
+| `token` | — | `mode: activities` 时必填。主页 URL 里的 token，如 `https://www.zhihu.com/people/kvxjr369f` → `kvxjr369f` |
+| `entry_name` | `all` | `mode: notifications` 时的通知分类（页面上那几个 tab），见「zhihu · 通知中心」 |
+| `limit` | `20` | `mode: notifications` 时每页条数 |
 | `max_pages` | `5` | 最多翻几页 |
-| `dedupe_by_content` | `true` | 正文相同的只保留一条（跨窗口，见下） |
-| `dedupe_memory_days` | `45` | 去重指纹记多久（0 = 只比窗口内的条目） |
-| `fulltext` | `true` | 导航到内容页抓全文 |
+| `dedupe_by_content` | `true` | 正文相同的只保留一条（跨窗口，见下）。`mode: notifications` 时不参与 |
+| `dedupe_memory_days` | `45` | 去重指纹记多久（0 = 只比窗口内的条目）。`mode: notifications` 时不参与 |
+| `fulltext` | `true` | 导航到内容页抓全文。`mode: notifications` 时不参与 |
 | `max_fulltext_per_run` | `10` | 每次运行最多补几篇全文 |
 | `list_retries` | `2` | 列表接口偶发风控时的重试次数 |
 | `list_retry_delay_s` | `15` | 每次重试之间的等待秒数 |
+
+### zhihu · 通知中心（`mode: notifications`）
+
+`type: zhihu` 还有第二种用法：抓**你自己收到的**通知
+（`https://www.zhihu.com/notifications`）—— 谁回复/评论了你、谁赞同喜欢了你、
+谁关注了你，以及各种邀请和站务通知。和抓别人的主页动态不同，这个源**不需要 `token`**：
+
+```yaml
+  - id: zhihu-notifications
+    type: zhihu
+    title: 知乎通知
+    site_url: https://www.zhihu.com/notifications
+    options:
+      mode: notifications      # 不写 = activities，抓个人主页动态
+      entry_name: all          # 通知分类，见下
+```
+
+接口是 `api/v4/notifications/v2/recent`（通知中心页面自己调的也是它），
+`entry_name` 就对应页面上那几个 tab：
+
+| `entry_name` | 页面上的名字 |
+|---|---|
+| `all` | 全部通知（默认） |
+| `follow` | 关注我的 |
+| `like` | 赞同与喜欢 |
+| `comment` | 评论与回复 |
+| `mention` | 提到我的 |
+| `invite` | 邀请 |
+| `community` | 站务通知 |
+| `system` | 系统通知 |
+| `follow_question_add_answer` | 关注的问题 |
+
+> ⚠️ 名字写错**接口不会报错**，只会静默返回一个空列表 —— feed 于是永远是空的。
+> 所以配置里填错的话，代码会直接抛 `未知的通知分类 entry_name=…` 并把可选值列出来。
+
+翻页方式和动态那边不一样：接口的 `offset` 是个**时间戳**（上一页最后一条的
+`create_time`），不是页码 —— 照它回的 `paging.next` 走，翻到头 `is_end` 为真。
+（那个 next 给的是 `http://` 地址，在 https 页面里 fetch 会被当混合内容拦掉，
+代码里统一补成了 https。）`limit` 是每页条数（默认 20），`max_pages` 默认 5。
+
+标题沿用知乎那边的格式，`谁 + 干了什么 + ： + 相关内容`：
+
+```
+行庸（作者） 回复了回答下的所有人：全国牛肉批发均价涨至一公斤 71 元，创两年来新高，受哪些因素影响？
+q9adg 回复了回答下你的评论：如何看待“谁善待员工就买谁的产品”这个观点?
+酱紫君 的提问等你来答：能不能根据圆周率，通过算法编成音乐？
+举报处理通知：您举报的评论已被处置，感谢您的反馈。
+```
+
+正文是 `动作 / 回复正文 / 相关内容标题 / 链接` 四段（回复正文就是通知里那句
+`content.extend.text`；喜欢、关注这类没有正文，只有三段）。动作单独成段除了好读，
+也是 `_body_of` 认「哪段是正文」的锚点，和动态那边保持同一种结构。
+
+有两点和动态那边不同：
+
+- **不做正文去重、不抓全文、也不清理「旧版本」**：通知是平台生成的一条条记录，
+  没有全文可补，也没有「同一条内容换个动作又出现一次」的孪生。
+- **条目 id 是 `zhihu-notif:<通知 id>`**，直接用平台自己的通知 id。平台会把同类通知
+  **合并**（多人点赞同一条评论合成一条，`merge_count` 从 1 变 2、3…），合并后 actors
+  会变多但 id 不变 —— 好处是阅读器不会因为多了一个赞就重复提醒，代价是已经收下的
+  那条不会跟着刷新（见「阅读器那一侧的缓存」）。
 
 ### bilibili · `embed_player`
 
@@ -925,6 +990,50 @@ WKWebView 对这种 DOM 全屏支持很差，退出时留下黑色图层。
 > 存量条目不用手动重置：`postprocess` 每轮都会对合并后的全量条目过一遍
 > `_strip_noscript()`（幂等，重复跑无副作用），所以带重复图的老条目跑一轮就自己好了。
 > 这点和全文不同 —— 全文抓错了必须删标记重抓（见上），这个只改渲染结果，不依赖重新抓取。
+
+#### 公式（LaTeX）要换成公式图
+
+正文里的公式是 `<span class="ztext-math" data-tex="...">`，页面上靠 MathJax 在浏览器里
+把它渲染成内联 `<svg>`。feed 里是一份**死 HTML**，两种抓取时机都很糟：
+
+| 抓的时候 MathJax | 抓到的是什么 | 阅读器里看到 |
+| --------------- | ------------ | ------------ |
+| 还没渲染完（常见） | `.math-holder` 里那段原始 TeX 源码 | 满篇 `\mathrm{RCA}_0 \subsetneq \mathrm{WKL}_0 ...`（实测 GalAster 一个源 441 处） |
+| 已经渲染完 | 内联 `<svg>`，里面全是 `<use xlink:href="#E1-...">` | 大概率空白：那些字形定义在同页面另一个隐藏 `<svg>` 的 `<defs>` 里，没跟着搬过来 |
+
+阅读器里既没有 MathJax、搬过去的 SVG 又是残缺的，所以 `_fix_math()` 统一换成**知乎自己的
+公式图接口**（老版知乎的正文本来就是这么发图的；`data-eeimg="1"` 是行内，带 `&inline=true`，
+`"2"` 独立成行，不带）：
+
+```html
+<img class="eeimg" src="https://www.zhihu.com/equation?tex=%5Cmathrm%7BRCA%7D_0..." alt="\mathrm{RCA}_0 ...">
+```
+
+实测这个接口不要 cookie、不看 Referer（带外站 Referer 也照给），返回的 SVG 把字形定义全写在
+同一个文件里（`<defs>` 里的 path 一个不缺，`\begin{aligned}` 的多行公式也照给），阅读器直接取
+就能画。`alt` 留着原始 TeX：图片挂了、或者阅读器干脆不显示图片时，至少还认得出写的是什么。
+
+TeX 从哪儿取（渲染前后都能拿到，所以抓取时机不再影响结果）：
+
+| 抓到的形态 | 用哪份 |
+| ---------- | ------ |
+| 有 `data-tex` 属性 | 直接用它（渲染前后都在，最可靠） |
+| 只有 `<script type="math/tex">` | 取 script 里那段 |
+| 都丢了、只剩 `.math-holder` 的兜底文字 | 拿那段文字当 TeX |
+| 什么都认不出来 | 原样留着，不猜、也不把内容丢掉 |
+
+实测改造量：GalAster 441 处、yuhang-liu 65 处、kvxjr369f 6 处（nell 没有），落在 16 条回答上。
+
+> 存量条目不用手动重置：和 `_strip_noscript()` 一样，`postprocess` 每轮都对合并后的全量条目
+> 过一遍 `_fix_math()`（幂等，重复跑无副作用），跑一轮就自己好了。它放在 `postprocess`
+> **最后**是有意的：正文指纹按摘要算、算出来就粘住（见 `_dedup_key`），这里动 content
+> 不该影响去重结果。
+
+代价是公式图成了**外链**：知乎那个接口带 `no-store`，缓存不了，公式多的回答一篇就上百张图
+（GalAster 那篇讲逆数学的 148 张），阅读器刷一次相当于发上百个图片请求。想收回来可以内联成
+data URI 或让本地 `local-rss-http` 代理并缓存，但 feed 会大出好几 MB，暂时不值当 ——
+现在 `zhihu-GalAster.xml` 575 KB，改造前 590 KB：反而小了，因为原来每个公式都要把 TeX 源码
+在 `data-tex`、`<script>`、兜底文字里存三份。
 
 ## 过滤与去重规则
 
