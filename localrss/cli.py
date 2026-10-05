@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
 import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -14,8 +16,11 @@ from . import feed as feed_mod
 from . import notify
 from . import providers
 from . import websub
+from .archive import Archive, human_size
 from .bridge import Bridge, BridgeError, StopRequested, check_bridge
 from .config import Config, load_config
+from .models import Item
+from .providers.base import plain_text
 from .store import Store
 
 DEFAULT_CONFIG = "config.yaml"
@@ -69,6 +74,18 @@ def _feed_url(cfg: Config, feed_cfg) -> str:
     if cfg.base_url:
         return f"{cfg.base_url}/{feed_cfg.filename}"
     return feed_cfg.filename
+
+
+def _archive_for(feed_cfg, cfg: Config) -> Archive | None:
+    """这个源要不要归档；返回对应的 Archive（关了则 None）。
+
+    feed 自己的 `archive` 覆盖全局 `output.archive`。归档目录里每个源一份
+    `archive/<feed-id>.jsonl`，滚出 history 窗口的条目按条追加进去。
+    """
+    enabled = cfg.archive if feed_cfg.archive is None else feed_cfg.archive
+    if not enabled:
+        return None
+    return Archive(cfg.archive_dir, feed_cfg.id, cfg.archive_rotate_bytes)
 
 
 def _notify_hub(feed_cfg, cfg: Config) -> bool:
@@ -144,9 +161,10 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
                   history=feed_cfg.history or cfg.history)
     # --force：假装本地什么都没有，翻满 max_pages 重抓一遍。
     # 但仍然合并进原有 state（不是清空），所以知乎全文这类补全过的内容不会丢。
-    # before_ids 是本轮之前 state 里已有的 id，用来算「筛选之后真正新增了几条」
-    # （见下面 new_visible）—— force 时也要留着，不然通知里会谎报全量。
-    before_ids = store.known_ids()
+    # before 是本轮之前 state 里有的条目（带着上一轮后处理的结果，比如知乎全文），
+    # 用来算两件事：增量抓取的已知 id、以及本轮有哪些条目离开了 state（要归档）。
+    before = store.load()
+    before_ids = {i.id for i in before}
     known = set() if force else before_ids
 
     items = provider.fetch(bridge, known)
@@ -190,6 +208,38 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
     # 否则下次运行还得重抓一遍。注意存的是 merged（全量），不是 visible。
     store.save(merged)
 
+    # 持续归档：把「本轮离开了 state 的条目」追加进 archive/<id>.jsonl。
+    # 离开 state = 被 history 挤出窗口（最常见）、或者被 prune_superseded 换掉的
+    # 旧版本；它们还在上一轮的 before 里，带着当时后处理好的内容（比如知乎全文）。
+    # 另外补一类极端的：本次抓到、但一进来就被挤出窗口的（history 小 + 一次抓一大批）。
+    # 内容已经包含在别的条目里的（bilibili 的合集成员）由 provider 报出来跳过 ——
+    # 那不是丢，是换了地方，见 Provider.absorbed_ids。
+    # RSS 条数不受影响，只是这些内容不再随着下一轮运行消失。
+    archived = 0
+    archive_path = ""
+    arch = _archive_for(feed_cfg, cfg)
+    if arch is not None:
+        saved_ids = {i.id for i in merged}
+        absorbed = provider.absorbed_ids(merged)
+        gone = [
+            i for i in before
+            if i.id not in saved_ids and i.id not in absorbed
+        ]
+        gone += [
+            i for i in items
+            if i.id not in saved_ids
+            and i.id not in before_ids
+            and i.id not in absorbed
+        ]
+        if gone:
+            try:
+                arch.append(gone)
+                archived = len(gone)
+                archive_path = str(arch.live)
+            except OSError as e:
+                # 归档失败不该让整轮算失败 —— RSS 已经生成了，只是这份历史没留下来
+                print(f"[{feed_cfg.id}] 归档失败：{e}", file=sys.stderr)
+
     output_path = cfg.output_dir / feed_cfg.filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # feed 的订阅地址：既是 RSS 里的 <atom:link rel="self">，也是 WebSub 通知 hub 的 topic
@@ -214,7 +264,78 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
         "grouped": grouped,
         "derived": provider.derived_items,
         "dropped_log": dropped_log_path,
+        "archived": archived,
+        "archive_path": archive_path,
     }
+
+
+def _archive_haystack(item: Item) -> str:
+    return f"{plain_text(item)}\n{item.link or ''}\n{item.author or ''}".lower()
+
+
+def _archive_line(item: Item) -> str:
+    when = f"{item.published:%Y-%m-%d %H:%M}" if item.published else "-"
+    title = " ".join((item.title or "").split()) or "(无标题)"
+    return f"{when} | {title} | {item.link or '-'}"
+
+
+def cmd_archive_stats(cfg: Config) -> int:
+    """每个源一行：归档了几个文件、多大、多少条、时间范围。"""
+    if cfg.archive:
+        rotate = (
+            f"单个文件满 {cfg.archive_rotate_mb} MB 压缩"
+            if cfg.archive_rotate_mb else "不压缩轮转"
+        )
+    else:
+        rotate = "全局已关闭"
+    print(f"== 归档（{cfg.archive_dir}，{rotate}）==")
+    for feed_cfg in cfg.feeds:
+        arch = _archive_for(feed_cfg, cfg)
+        if arch is None:
+            print(f"  {feed_cfg.id:<24} 已关闭（archive: false）")
+            continue
+        s = arch.stats()
+        if not s["files"]:
+            print(f"  {feed_cfg.id:<24} 还没有归档"
+                  "（条目滚出 history 窗口时才会进来）")
+            continue
+        span = "-"
+        if s["first"] and s["last"]:
+            span = f"{s['first']:%Y-%m-%d} ~ {s['last']:%Y-%m-%d}"
+        print(f"  {feed_cfg.id:<24} {s['files']} 个文件  "
+              f"{human_size(s['bytes']):>9}  {s['items']} 条  {span}")
+    return 0
+
+
+def cmd_archive_dump(
+    cfg: Config, feed_id: str, limit: int = 0, grep: str = "", as_json: bool = False
+) -> int:
+    """打印某个源的历史条目（默认取**最新**的，`--limit` 限条数，`--grep` 过滤）。"""
+    feed_cfg = next((f for f in cfg.feeds if f.id == feed_id), None)
+    if feed_cfg is None:
+        print(f"配置里没有这个源: {feed_id}", file=sys.stderr)
+        return 2
+    arch = _archive_for(feed_cfg, cfg)
+    if arch is None:
+        print(f"[{feed_id}] 这个源的归档已关闭（config 里 archive: false）",
+              file=sys.stderr)
+        return 2
+
+    keyword = grep.strip().lower()
+    records = (
+        rec for rec in arch.iter_records()
+        if not keyword
+        or keyword in _archive_haystack(Item.from_dict(rec["item"]))
+    )
+    if limit > 0:
+        # 要「最新的 N 条」，所以得读完才知道尾巴 —— deque 只留 N 条，内存是常数
+        records = iter(deque(records, maxlen=limit))
+    for rec in records:
+        if as_json:
+            print(json.dumps(rec, ensure_ascii=False))
+        else:
+            print(_archive_line(Item.from_dict(rec["item"])))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -246,6 +367,32 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="只 ping hub 通知这些源有更新，不抓取（不占用浏览器，用来验证 WebSub 链路）",
     )
+    parser.add_argument(
+        "--archive-stats",
+        action="store_true",
+        help="看每个源的持续归档：文件数 / 体积 / 条数 / 时间范围（不抓取）",
+    )
+    parser.add_argument(
+        "--archive-dump",
+        metavar="FEED",
+        help="把某个源的全部历史条目打印出来（不抓取）",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="--archive-dump 最多打印多少条（默认 0 = 全部；给 N 时取最新的 N 条）",
+    )
+    parser.add_argument(
+        "--grep",
+        default="",
+        help="--archive-dump 只打印标题/正文/链接/作者命中这个关键词的条目",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="--archive-dump 输出 JSONL（原始归档记录），不输出可读文本",
+    )
     args = parser.parse_args(argv)
 
     # 停止信号先只置位，等当前这次 WebBridge 调用收尾再中断（见 _setup_signals）。
@@ -268,6 +415,14 @@ def main(argv: list[str] | None = None) -> int:
             mark = " " if f.enabled else "x"
             print(f"[{mark}] {f.id:24} type={f.type:10} {f.title}")
         return 0
+
+    # 归档查询：只读本地文件，不需要 WebBridge，所以放在建 bridge 之前
+    if args.archive_stats:
+        return cmd_archive_stats(cfg)
+    if args.archive_dump:
+        return cmd_archive_dump(
+            cfg, args.archive_dump, limit=args.limit, grep=args.grep, as_json=args.json
+        )
 
     if args.clean:
         bridge = Bridge(
@@ -349,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[{feed_cfg.id}] 新增 {r['added']} 条，共 {r['total']} 条{notes} -> {r['path']}")
                 if r["dropped_log"] and r["dropped"]:
                     print(f"[{feed_cfg.id}] 过滤清单（覆盖写）-> {r['dropped_log']}")
+                if r["archived"]:
+                    print(f"[{feed_cfg.id}] 归档 {r['archived']} 条 -> {r['archive_path']}")
                 # 有新条目才通知 hub —— hub 收到就来抓 feed 并推给订阅者。
                 # 没有新内容那种常见运行就不打扰它了（通知失败不影响抓取结果）。
                 # derived：本轮没抓到新动态，但 postprocess 自己造了条目（比如攒够

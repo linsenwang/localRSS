@@ -21,6 +21,8 @@ class FeedConfig:
     enabled: bool = True
     history: int | None = None  # 覆盖 output.history；None 表示用全局默认
     hub_url: str = ""  # 覆盖 output.hub_url；空字符串表示用全局默认
+    #: 覆盖 output.archive；None 表示用全局默认
+    archive: bool | None = None
     options: dict = field(default_factory=dict)
     #: 该源额外的关键词过滤，叠加在顶层 exclude_keywords 之上（只对本源生效）
     exclude_keywords: list[str] = field(default_factory=list)
@@ -42,6 +44,11 @@ class Config:
     output_dir: Path
     state_dir: Path
     log_dir: Path
+    #: 持续归档：滚出 history 窗口的条目追加到 archive_dir/<feed-id>.jsonl，一直留着
+    archive_dir: Path
+    archive: bool
+    #: 单个归档文件超过这么多 MB 就压缩轮转；0 = 不轮转
+    archive_rotate_mb: int
     history: int
     base_url: str
     hub_url: str
@@ -52,6 +59,10 @@ class Config:
     #: 抓完有新内容时发一条 macOS 通知（osascript）
     notify: bool
     feeds: list[FeedConfig]
+
+    @property
+    def archive_rotate_bytes(self) -> int:
+        return max(0, self.archive_rotate_mb) * 1024 * 1024
 
     def enabled_feeds(self, only: list[str] | None = None) -> list[FeedConfig]:
         feeds = [f for f in self.feeds if f.enabled]
@@ -107,6 +118,7 @@ def load_config(path: str | Path) -> Config:
                 enabled=bool(entry.get("enabled", True)),
                 history=int(entry["history"]) if entry.get("history") else None,
                 hub_url=str(entry.get("hub") or "").rstrip("/"),
+                archive=bool(entry["archive"]) if entry.get("archive") is not None else None,
                 options=dict(entry.get("options") or {}),
                 exclude_keywords=[
                     str(k)
@@ -127,6 +139,10 @@ def load_config(path: str | Path) -> Config:
         output_dir=resolve(output_cfg.get("dir"), "output"),
         state_dir=resolve(output_cfg.get("state_dir"), "state"),
         log_dir=resolve(output_cfg.get("log_dir"), "logs"),
+        archive_dir=resolve(output_cfg.get("archive_dir"), "archive"),
+        # 没写这个键 = 开（滚出窗口的条目一律归档），写 false 才关；单个源可再覆盖
+        archive=bool(output_cfg.get("archive", True)),
+        archive_rotate_mb=int(output_cfg.get("archive_rotate_mb", 100)),
         history=int(output_cfg.get("history", 300)),
         base_url=str(output_cfg.get("base_url") or "").rstrip("/"),
         hub_url=str(output_cfg.get("hub_url") or "").rstrip("/"),

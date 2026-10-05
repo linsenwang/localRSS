@@ -16,9 +16,9 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
-from ..bridge import Bridge
+from ..bridge import Bridge, same_page
 from ..models import Item, sort_key
 from . import register
 from .base import Provider, retry_call
@@ -70,9 +70,33 @@ VERB_ACTIONS = {
     "MEMBER_FOLLOW_QUESTION": "关注了问题",
 }
 
+# 列表接口都是在「当前标签页」里 fetch 的，带的是这个页面的 cookie。请求没带上
+# 登录 cookie 时，知乎不回 401，只回 `403 {"code":10003}` +「请求参数异常，请升级
+# 客户端后重试。」—— 跟真正的风控响应是同一句，光看报错分不出是谁的问题。实测
+# 在 `credentials:'omit'` 和「在 t.bilibili.com 页面上 fetch」两种情况下，响应体
+# 一模一样，所以这里先自检，把「cookie 根本没带上」和「知乎真的拦了」分开：
+#
+#   not_on_page  页面不在 www.zhihu.com 上（上一轮留下的 B 站标签页、刚开出来还没
+#                commit 的新标签页）。知乎的登录 cookie 是 SameSite=Lax，跨站发的
+#                请求一个都不带 —— 切回目标页面立刻重来就好（见 _fetch_page）。
+#   no_cookie    页面是对的，但浏览器这会儿没把登录 cookie 交给页面：冷启动、机器
+#                刚唤醒、登录态过期都会这样，通常一两分钟自己就好了（实测线上的
+#                失败窗口 80~125 秒）。这种等着才有用，切页面、换接口都没用。
+PAGE_CHECK_JS = r"""
+    if (location.hostname !== 'www.zhihu.com') {
+      return { ok: false, not_on_page: true,
+               error: '当前标签页不在知乎页面上（' + location.href + '）' };
+    }
+    if (document.cookie.indexOf('SESSIONID=') < 0) {
+      return { ok: false, no_cookie: true,
+               error: '浏览器里没有知乎的登录 cookie（' + location.href + '）' };
+    }
+"""
+
 EXTRACT_JS = r"""
 (async () => {
   try {
+__PAGE_CHECK__
     const r = await fetch('__URL__', { credentials: 'include' });
     const j = await r.json();
     if (!j.data) {
@@ -130,6 +154,7 @@ EXTRACT_JS = r"""
 NOTIFICATIONS_EXTRACT_JS = r"""
 (async () => {
   try {
+__PAGE_CHECK__
     const r = await fetch('__URL__', { credentials: 'include' });
     const j = await r.json();
     if (!j.data) {
@@ -229,9 +254,19 @@ FULLTEXT_SELECTORS: dict[str, tuple[list[str], list[str]]] = {
 #: 这些类型「页面上没有正文」是正常情况（问题可以没有描述），不算抓取失败。
 OPTIONAL_CONTENT_TYPES = {"question"}
 
-PAGE_WAIT_MS = 3000      # 导航后等页面渲染
 ITEM_DELAY_MS = 3000     # 两次抓取之间的间隔（再叠随机抖动）
 MIN_CONTENT_LEN = 50
+
+#: 导航（navigate）之后最多等多久让新页面真的落地，见 ZhihuProvider._settle。
+#: navigate 是异步的，返回时新文档未必 commit；这段时间内还没落地就重新导航一次。
+PAGE_SETTLE_S = 4.0
+
+#: 发现「页面在知乎上、但浏览器没把登录 cookie 交出来」时等多久、隔多久再看一次。
+#: 这是浏览器侧的临时状态（冷启动 / 刚唤醒最典型），实测线上失败窗口 80~125 秒，
+#: 所以给 3 分钟耐心；到时候还没有就是要重新登录了，照常报错。同一轮里这份耐心是
+#: 共享的（记在 bridge 上），不会每个源都从头等一遍。
+COOKIE_WAIT_S = 180.0
+COOKIE_RETRY_S = 20.0
 
 # 正文的等待策略。长回答是**分阶段**渲染的：页面先给一小段（约 2 KB HTML，
 # 几百字），随后整篇才替换进来 —— 固定等 3 秒会稳定地抓到那个半截版本，
@@ -341,15 +376,40 @@ def _extract_js(title_selectors: list[str], content_selectors: list[str]) -> str
     """
 
 
-def _same_page(final_url: str, expected_url: str) -> bool:
-    """页面最终 URL 与目标是否还是同一个内容页（忽略 query/hash）。"""
-    try:
-        f, e = urlsplit(final_url), urlsplit(expected_url)
-        if f.netloc != e.netloc:
-            return False
-        return f.path.rstrip("/") == e.path.rstrip("/")
-    except Exception:
-        return final_url.split("?")[0] == expected_url.split("?")[0]
+#: 「浏览器暂时交不出知乎登录 cookie」这份耐心记在 bridge 上，同一次运行里的所有
+#: 源共用：一个源等到了，后面的源就不用从头再等一遍；真等不到时也不会每个源都
+#: 各花 3 分钟 —— 第一个等完还没好，后面的立刻按失败处理。
+_COOKIE_DEADLINE_ATTR = "zhihu_cookie_deadline"
+
+
+def _cookie_deadline(bridge: Bridge) -> float:
+    """本轮「再等一会儿」的截止时刻（monotonic）。
+
+    还没等过就开一个窗口；已经等过的（哪怕是已经超时的那次）原样返回，
+    这样同一次运行里只花一份时间，不会每个源都从头再等一遍。
+    """
+    deadline = getattr(bridge, _COOKIE_DEADLINE_ATTR, None)
+    if deadline is None:
+        deadline = time.monotonic() + COOKIE_WAIT_S
+        setattr(bridge, _COOKIE_DEADLINE_ATTR, deadline)
+    return float(deadline)
+
+
+def _clear_cookie_deadline(bridge: Bridge) -> None:
+    """拿到数据了：这回登录态是好的，下次真出问题就重新给一份耐心。"""
+    setattr(bridge, _COOKIE_DEADLINE_ATTR, None)
+
+
+#: 「知乎源共用同一页」这件事每轮只说一遍，别每个源都打一行。
+_REUSE_NOTED_ATTR = "zhihu_page_reuse_noted"
+
+
+def _note_page_reuse(bridge: Bridge, page: str) -> None:
+    if getattr(bridge, _REUSE_NOTED_ATTR, False):
+        return
+    setattr(bridge, _REUSE_NOTED_ATTR, True)
+    print(f"    [页面] 知乎各源共用 {page}（列表接口按 token 取数，不必每个源切页）",
+          file=sys.stderr)
 
 
 def _id_from_link(link: str) -> str:
@@ -678,6 +738,62 @@ class ZhihuProvider(Provider):
             return NOTIFICATIONS_PAGE
         return PROFILE.format(token=self.require("token"))
 
+    def setup(self, bridge: Bridge) -> None:
+        """确保当前标签页在知乎上 —— 同站里已经有页面就直接复用，不切页。
+
+        列表接口的 token 在 URL 里（`api/v3/moments/<token>/activities`），页面是
+        哪个答主的、是不是通知中心，都不影响返回什么 —— 只要页面在 `www.zhihu.com`
+        上，请求就是同站的、带得上登录 cookie。所以四个动态源共用一页就够了，
+        不必为了「打开页面 X」这句日志好看每轮多加载四次整页。
+
+        真正要防的只有跨站那一种：上一条源是 B 站时当前标签页还停在 `t.bilibili.com`
+        上（后台标签页，脚本刚把新标签页开出来就跑过来了），那时 fetch 属于跨站，
+        `SameSite=Lax` 的登录 cookie 一个都不带，接口只会回「请求参数异常，请升级
+        客户端后重试。」（见 PAGE_CHECK_JS 的说明）。所以只有页面不在知乎上时才导航，
+        并且等它真的落地 —— navigate 是异步的，返回时新文档未必 commit。
+        """
+        expected = self.page_url()
+        page = bridge.evaluate("({href: location.href, host: location.hostname})") or {}
+        current = str(page.get("href") or "")
+        if page.get("host") == "www.zhihu.com":
+            if not same_page(current, expected):
+                _note_page_reuse(bridge, current)
+            return
+        bridge.ensure_tab(expected, group_title=self.opt("group_title"))
+        if self._settle(bridge, expected, PAGE_SETTLE_S) is None:
+            print(f"    [标签页] 当前标签页还没落到 {expected}，重新打开", file=sys.stderr)
+            self._goto(bridge, expected)
+
+    def _settle(self, bridge: Bridge, expected: str, timeout_s: float) -> str | None:
+        """等当前标签页的 location.href 变成 expected；等到了返回它，超时返回 None。"""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            current = bridge.evaluate("location.href") or ""
+            if same_page(current, expected):
+                return current
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.4)
+
+    def _goto(self, bridge: Bridge, url: str) -> str:
+        """把标签页导航到 url，等它落地后返回落地时的 URL。
+
+        第一次沿用当前标签页（调用方刚确认过它是本 session 自己的标签页）；
+        没落到 url 上就换新标签页再来一次 —— 当前标签页偶尔会和浏览器里真正在
+        跑的那份文档对不上，重开一个能绕开卡住的那个。
+        """
+        for attempt in range(2):
+            args: dict = {"url": url}
+            if attempt:
+                args["newTab"] = True
+            else:
+                args["group_title"] = self.opt("group_title")
+            bridge.call("navigate", args)
+            current = self._settle(bridge, url, PAGE_SETTLE_S)
+            if current is not None:
+                return current
+        return bridge.evaluate("location.href") or ""
+
     def fetch(self, bridge: Bridge, known_ids: set[str]) -> list[Item]:
         if self.mode == MODE_NOTIFICATIONS:
             return self._fetch_notifications(bridge, known_ids)
@@ -765,9 +881,39 @@ class ZhihuProvider(Provider):
                     template: str = EXTRACT_JS,
                     label: str = "知乎动态") -> dict:
         """抓一页列表。失败抛异常，由 retry_call 决定要不要重来。"""
-        result = bridge.evaluate(template.replace("__URL__", url))
+        code = template.replace("__URL__", url).replace("__PAGE_CHECK__", PAGE_CHECK_JS)
+        deadline = _cookie_deadline(bridge)
+        repairs = 0
+        result = None
+        while True:
+            result = bridge.evaluate(code)
+            if not result or result.get("ok"):
+                _clear_cookie_deadline(bridge)
+                break
+            if result.get("not_on_page") and repairs < 2:
+                # 页面不在知乎上：跟接口本身没关系，等多久都是同一句「请求参数异常」。
+                # 切回目标页面立刻重来一次，别让它白占 retry_call 那 15 秒的重试。
+                repairs += 1
+                print(f"    [标签页] {result.get('error')}，切回 {self.page_url()} 后重试",
+                      file=sys.stderr)
+                self.setup(bridge)
+                continue
+            if result.get("no_cookie") and time.monotonic() < deadline:
+                # 页面没问题，是浏览器这边暂时交不出登录 cookie（冷启动、刚唤醒最
+                # 典型）。在原地快重试没用（线上就是这么三连失败的），这里拉长间隔
+                # 慢慢等 —— 什么都不用做，时间到了它自己就好。
+                # 注意别在这里 reload 页面：那是用户正在看的窗口，反复刷新很难受，
+                # 而且也没有证据说刷新能加快恢复。
+                print(f"    [登录态] {result.get('error')}，{COOKIE_RETRY_S:.0f}s 后再看一次"
+                      f"（等浏览器把 cookie 交出来，最多等到 {deadline - time.monotonic():.0f}s 后）",
+                      file=sys.stderr)
+                time.sleep(COOKIE_RETRY_S)
+                continue
+            break
         if not result or not result.get("ok"):
             detail = (result or {}).get("error") or result
+            if result and result.get("no_cookie"):
+                detail = f"{detail}；请在浏览器里确认知乎还登着（或用 ./main.sh clean 后重跑）"
             raise RuntimeError(f"知乎接口返回异常（{label}第 {page} 页）: {detail}")
         return result
 
@@ -955,14 +1101,11 @@ class ZhihuProvider(Provider):
             # 知乎新出的动态类型：还没配选择器，明说而不是悄悄当成功
             raise RuntimeError(f"还没有 {item_type!r} 这类页面的选择器（FULLTEXT_SELECTORS）")
         title_sels, content_sels = selectors
-        # 在当前标签页里导航（不是新开标签），抓完由 session 统一清理
-        bridge.call("navigate", {"url": url})
-        # 先等导航落定，再确认没被重定向；正文什么时候算渲染好由下面的
-        # _extract_js 在页面里轮询判断（固定 sleep 会抓到半截）
-        time.sleep(PAGE_WAIT_MS / 1000)
-
-        final_url = bridge.evaluate("location.href") or ""
-        if final_url and not _same_page(final_url, url):
+        # 在当前标签页里导航（不是新开标签），抓完由 session 统一清理。
+        # _goto 会回读确认真的到了目标页，没到就（换新标签页）再来一次 ——
+        # 否则这里会拿着上一页的 DOM 当正文，或者被下面的重定向检查误判成风控。
+        final_url = self._goto(bridge, url)
+        if final_url and not same_page(final_url, url):
             raise RuntimeError(f"页面被重定向到 {final_url}（内容不可用或触发风控）")
 
         val = bridge.evaluate(_extract_js(title_sels, content_sels))
@@ -979,6 +1122,11 @@ class ZhihuProvider(Provider):
         return _clean_zhihu_html(val.get("content", ""))
 
     def _pin_api(self, bridge: Bridge, pin_id: str) -> str:
+        # fetch 只带当前标签页的 cookie：页面不在知乎上时这个接口必定回
+        # 「请求参数异常」，那就别试了，直接交给 _from_page 去导航到想法页。
+        host = bridge.evaluate("location.hostname") or ""
+        if host != "www.zhihu.com":
+            raise RuntimeError(f"当前标签页不在知乎上（{host or '(空)'}）")
         r = bridge.fetch_json(f"https://www.zhihu.com/api/v4/pins/{pin_id}")
         if not r.get("ok"):
             raise RuntimeError(f"pin API 请求失败: status={r.get('status')} error={r.get('error')}")

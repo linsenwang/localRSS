@@ -34,7 +34,17 @@ output:
   notify: true
   # 每个源最多保留多少条（默认值，可被各个 feed 的 history 覆盖）。
   # 注意这是「条数」上限，不按体积算：带全文的源每条体积大得多，所以单独调小了。
+  # 这只影响 RSS 里显示多少条 —— 滚出窗口的条目不会丢，见下面的 archive。
   history: 150
+  # 持续归档：滚出上面 history 窗口（以及被新版本取代）的条目会按条追加到
+  # archive/<feed-id>.jsonl，一直留着 —— RSS 还是 history 那么多条，历史一条不丢。
+  # 单个文件超过 archive_rotate_mb 就压成 archive/<feed-id>.<时间戳>.jsonl.gz，
+  # 另起一个空的 .jsonl 继续追加（.gz 用 `gzip -dc` / `zgrep` 直接能读）。
+  # 想关掉写 archive: false；单个源也能用自己的 archive 键覆盖。
+  # 看归档情况：./main.sh archive         导出/搜索：./main.sh archive dump <源 id>
+  archive: true
+  archive_dir: archive
+  archive_rotate_mb: 100
   # 订阅服务的地址前缀（由 pm2 里的 local-rss-http 提供，端口见 ecosystem.config.js）。
   # 用于 RSS 里的 <atom:link rel="self">，也是 WebSub 通知 hub 时用的 feed 地址。
   # 注意：这必须是**订阅者和 hub 都用得到的地址**。FreshRSS 拿它当 WebSub 的 topic，

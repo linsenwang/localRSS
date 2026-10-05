@@ -2,6 +2,7 @@
 output/*.xml
 state/*.json
 logs/*.log
+archive/
 
 # Python
 __pycache__/

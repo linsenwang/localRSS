@@ -12,12 +12,24 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 DEFAULT_URL = "http://127.0.0.1:10086/command"
 #: 默认自动打开的浏览器（macOS 应用名），见 check_bridge
 DEFAULT_BROWSER = "Google Chrome"
 #: 开完浏览器后等扩展连上的上限（秒）
 CONNECT_TIMEOUT_S = 30
+
+
+def same_page(a: str, b: str) -> bool:
+    """两个 URL 是不是同一个页面（同站点 + 同路径；query/hash/结尾斜杠忽略）。"""
+    try:
+        pa, pb = urlsplit(a or ""), urlsplit(b or "")
+    except ValueError:
+        return False
+    if not pa.netloc or pa.netloc != pb.netloc:
+        return False
+    return pa.path.rstrip("/") == pb.path.rstrip("/")
 
 
 class BridgeError(RuntimeError):
@@ -126,12 +138,25 @@ class Bridge:
 
         single-tab 类工具（evaluate/snapshot/...）都作用于“当前标签页”，
         所以每次在某个站点上执行 JS 前都必须先把标签页切过去。
+
+        注意 find_tab 是**按站点**匹配的（官方文档：`kimi.com` 也能命中
+        `www.kimi.com`，路径直接忽略），所以「命中」不等于当前标签页就在 url 上：
+        同一个站点的别的页面（上一个源留下的、上一轮遗留的）也算命中，这时必须
+        自己导航过去。不导航的话后面所有 evaluate 都落在那一页上 —— 跨站时 fetch
+        带不上登录 cookie（接口只会回一句含糊的「参数异常」，见 providers/zhihu.py
+        的 PAGE_CHECK_JS），同站时抓到的是别的页面的数据。
         """
         data = self.try_call("find_tab", {"url": url})
         if data is not None:
-            return
-        args: dict = {"url": url, "newTab": True}
-        if group_title:
+            current = str(data.get("url") or "")
+            if same_page(current, url):
+                return
+            print(f"    [标签页] 命中同站的 {current}，导航到 {url}", file=sys.stderr)
+        args: dict = {"url": url}
+        # 本 session 里根本没有这个站点的标签页：新开一个，不动用户自己的页面
+        if data is None:
+            args["newTab"] = True
+        elif group_title:
             args["group_title"] = group_title
         self.call("navigate", args)
 

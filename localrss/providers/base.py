@@ -112,6 +112,16 @@ class Provider:
         """切换到正确的标签页；默认实现足够，一般不用改。"""
         bridge.ensure_tab(self.page_url(), group_title=self.opt("group_title"))
 
+    def absorbed_ids(self, items: list[Item]) -> set[str]:
+        """这些 id 的内容已经包含在列表里别的条目中了 —— 归档时跳过它们。
+
+        bilibili 的图片合集是典型：合集的成员条目自己也在 state 里（合成后并没有删掉），
+        但轮到自己被 history 裁掉时，正文早就拼进那条合集条目、跟着合集一起留着
+        （合集按最新成员的时间排序，会晚一步被裁，那时整份合集才进归档）。
+        所以成员滚出窗口时不必再单独归档一份 —— 内容没丢，只是换了地方。
+        """
+        return set()
+
     def prune_superseded(self, items: list[Item]) -> list[Item]:
         """剔掉已经被新版本取代的旧条目；默认什么都不做。
 

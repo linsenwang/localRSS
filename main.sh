@@ -8,6 +8,9 @@
 #   ./main.sh clean              关掉 session 里遗留的浏览器标签页
 #                                （daemon 没登记上的孤儿标签它够不着，只能手动在浏览器里关）
 #   ./main.sh ping [源]          只 ping hub 通知有更新（不抓取，用来验证 hub 链路）
+#   ./main.sh archive            看各源的持续归档（文件数 / 体积 / 条数 / 时间范围）
+#   ./main.sh archive dump <源> [--limit N] [--grep 词] [--json]
+#                                导出某个源的历史条目（默认最新的在前，全部）
 #   ./main.sh status             看 pm2 进程 / 订阅地址 / 数据概览
 #   ./main.sh log [行数]         看最近抓取日志（默认 20 行）
 #   ./main.sh restart|stop|start 控制 pm2 里的定时抓取任务
@@ -91,6 +94,12 @@ PY
   done
 
   echo
+  python3 "$SCRIPT_DIR/rss.py" --archive-stats 2>/dev/null || {
+    echo "== 归档 =="
+    echo "  （读取失败）"
+  }
+
+  echo
   echo "== 关键配置 =="
   grep -E "^\s+(cron_restart|PORT|HOST):" ecosystem.config.js | sed 's/^/  /'
 }
@@ -111,6 +120,19 @@ cmd_ping() {
   python3 "$SCRIPT_DIR/rss.py" --ping "$@"
 }
 
+# 归档查询同样不需要浏览器：只读 archive/ 里的本地文件。
+#   ./main.sh archive                              看各源概览
+#   ./main.sh archive dump <源> [--limit N] [--grep 词] [--json]
+cmd_archive() {
+  if [ "${1:-}" = "dump" ]; then
+    shift
+    [ $# -ge 1 ] || { echo "用法：./main.sh archive dump <源 id> [--limit N] [--grep 词]" >&2; return 2; }
+    python3 "$SCRIPT_DIR/rss.py" --archive-dump "$@"
+  else
+    python3 "$SCRIPT_DIR/rss.py" --archive-stats "$@"
+  fi
+}
+
 usage() {
   awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
 }
@@ -120,6 +142,7 @@ case "${1:-}" in
   force)      shift; exec "$SCRIPT_DIR/run.sh" --force "$@" ;;
   clean)      shift; cmd_clean "$@" ;;
   ping)       shift; cmd_ping "$@" ;;
+  archive)    shift; cmd_archive "$@" ;;
   status)     shift; cmd_status "$@" ;;
   log)        shift; cmd_log "$@" ;;
   restart|stop|start)

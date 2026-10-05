@@ -5,6 +5,8 @@
     python3 rss.py zhihu-kvxjr369f # 只处理指定源
     python3 rss.py --list          # 列出源
     python3 rss.py --list-types    # 列出已支持的站点类型
+    python3 rss.py --archive-stats # 看持续归档（滚出窗口的老条目存在哪儿）
+    python3 rss.py --archive-dump bilibili-follow --limit 20   # 导出最近 20 条历史
 """
 
 import sys

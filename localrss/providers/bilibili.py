@@ -762,6 +762,10 @@ class BilibiliProvider(Provider):
             print(f"    [全文] {n}/{total} {item.id} ({got})")
         return items
 
+    def absorbed_ids(self, items: list[Item]) -> set[str]:
+        """合集成员的正文已经在合集条目里了，它们滚出窗口时不用再单独归档一份。"""
+        return _digested_ids(items)
+
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
         # items 是 cli 之后要落盘的那个列表（store.save(merged)），
         # 新建的合集必须留在里面，否则下次运行看不到 digest_ids，同一批图片会被重复合成。

@@ -35,6 +35,7 @@ python3 rss.py                 # 处理 config.yaml 里全部启用的源
 python3 rss.py zhihu-kvxjr369f # 只处理指定源
 python3 rss.py --list          # 列出配置里的源
 python3 rss.py --list-types    # 列出已支持的站点类型
+python3 rss.py --archive-stats # 看持续归档（滚出窗口的老条目存在哪儿，见「持续归档」）
 ```
 
 每次运行的结果：
@@ -50,8 +51,9 @@ python3 rss.py --list-types    # 列出已支持的站点类型
 - 之后是增量的：从第 1 页开始，**整页都是已有记录就停止翻页**，通常几秒钟结束。
 - 抓取时会在浏览器里打开对应页面（归在 `bridge.group_title` 这个标签组下），
   跑完会自动关掉，详见[标签页清理](#标签页清理)。
+- 有条目滚出 `history` 窗口时会多打一行 `[bilibili-follow] 归档 N 条 -> archive/...`，
+  RSS 的条数不变，这些内容被永久留下来了，见[持续归档](#持续归档滚出窗口的条目不再丢)。
 - 真的有新条目时，最后会弹一条 macOS 通知（多个源汇总成一条）：
-
   ```
   [通知] 已弹出 macOS 通知：2 个源有新内容（bilibili +5 · nell +1）
   ```
@@ -70,6 +72,8 @@ python3 rss.py --list-types    # 列出已支持的站点类型
 ./main.sh force bilibili-follow   # 组合
 ./main.sh clean            # 关掉遗留的浏览器标签页
 ./main.sh ping             # 只 ping hub 通知有更新（不抓取，用来验证 WebSub 链路）
+./main.sh archive          # 看各源的持续归档（文件 / 体积 / 条数 / 时间范围）
+./main.sh archive dump bilibili-follow --limit 20   # 导出最近 20 条历史条目
 ./main.sh status           # pm2 进程 / 订阅地址 / 数据概览
 ./main.sh log 50           # 最近 50 行抓取日志
 ./main.sh restart          # 重启 pm2 抓取任务（等于立刻跑一次）
@@ -96,6 +100,10 @@ python3 rss.py --list-types    # 列出已支持的站点类型
 == 状态 ==
   bilibili-follow.json           58 条   updated ...
   zhihu-kvxjr369f.json           35 条   全文 26 条   updated ...
+
+== 归档（.../archive，单个文件满 100 MB 压缩）==
+  bilibili-follow.json           3 个文件     1.2 MB  3481 条  2025-06-14 ~ 2026-09-28
+  zhihu-kvxjr369f                还没有归档（条目滚出 history 窗口时才会进来）
 ```
 
 ### 强制刷新（`./main.sh force`）
@@ -129,6 +137,9 @@ rm state/*.json && ./main.sh
 `max_fulltext_per_run` 分批重新补齐；跨窗口的去重指纹（`seen_content`）也没了，
 已经发过的正文可能被重发一次（一次运行就会重新攒回来）。
 
+**已经归档的历史不受影响**（归档是 `archive/` 里单独的一份，见「持续归档」）——
+删 state 只会让窗口重抓一遍。
+
 ## 改了配置多久生效
 
 | 改的东西 | 生效方式 |
@@ -137,6 +148,7 @@ rm state/*.json && ./main.sh
 | `filter_self_repost` / `filter_image_only` | **立即** |
 | `dedupe_by_content` / `dedupe_memory_days` | **立即** |
 | `output.dropped_log` | 下次运行（只是多写一份过滤清单，不影响 RSS 内容） |
+| `output.archive` / `archive_dir` / `archive_rotate_mb` | **立即**（改 `archive_dir` 会让后续归档写进新目录，旧目录里的不搬） |
 | `show_avatar` / `embed_player` | **立即** |
 | `image_digest_size` / `image_digest_max_age_hours` | 下次运行。**正文会跟着重渲染，但已经分好的批次不会重排** —— 要重来就删掉 state 里那些 `extra.kind == "image_digest"` 的条目 |
 | `max_pages` / `fulltext` / `max_fulltext_per_run` | 下次运行 |
@@ -594,7 +606,7 @@ launchctl kickstart -k gui/$(id -u)/com.localrss.refresh   # 立刻跑一次
 cron 版本：
 
 ```cron
-*/30 * * * * cd /Users/yangqian/Downloads/local_rss && ./run.sh >> logs/refresh.log 2>&1
+2,32 * * * * cd /Users/yangqian/Downloads/local_rss && ./run.sh >> logs/refresh.log 2>&1
 ```
 
 三种方式都统一走 `run.sh`，所以换调度器不用改代码。
@@ -625,6 +637,9 @@ output:
   dropped_log: true  # 每轮把被过滤掉的条目写成 <log_dir>/<feed-id>.dropped.log（覆盖写）
   notify: true       # 有新内容时弹一条 macOS 通知（多个源汇总成一条）
   history: 150       # 每个源最多保留多少条（可被各 feed 的 history 覆盖）
+  archive: true      # 持续归档：滚出 history 窗口的条目追加到 archive/ 一直留着
+  archive_dir: archive      # 归档目录
+  archive_rotate_mb: 100    # 单个归档文件满这么多 MB 就压缩轮转（0 = 不轮转）
   base_url: ""       # 可选，服务地址前缀（开了 WebSub 后就是 hub 抓 feed 用的那个地址）
   hub_url: ""        # 可选，WebSub hub 地址；留空 = 关闭（见「WebSub」一节）
 
@@ -645,6 +660,7 @@ feeds:
     file: bilibili-follow.xml  # 可选，自定义输出文件名
     enabled: true              # 可选，false 则跳过
     history: 150               # 可选，覆盖 output.history（按源单独设上限）
+    archive: false             # 可选，覆盖 output.archive（这个源不归档）
     exclude_keywords:          # 可选，只对本源生效，叠加在顶层的全局列表之上
       - 关于每天的早安行动
     options:                   # provider 各自的参数
@@ -1251,6 +1267,8 @@ feeds:
 
 超过上限时按时间从旧到新裁掉。调小之后下一次运行就会立刻生效（`merge` 时切片）。
 
+> 裁掉的条目**不会丢**：它们会被追加进持续归档，见下面的「持续归档」。
+
 ### zhihu 的列表重试
 
 平台偶发风控时会返回 `请求参数异常，请升级客户端后重试。`，
@@ -1269,6 +1287,44 @@ feeds:
 ```
 
 实现在 `localrss/providers/base.py` 的 `retry_call()`，其他 provider 也可以直接用。
+
+同一句话还有另外两个来源，都跟知乎的风控无关。三个来源的区分和处置写在
+`PAGE_CHECK_JS` / `_fetch_page` 里，日志前缀不同，看到就能对上：
+
+**1. 请求没从知乎页面上发出去**（前缀 `[标签页]`）。知乎那几个登录 cookie 是
+`SameSite=Lax`，页面不在 `www.zhihu.com` 上时浏览器一个都不带，接口回的正是
+`403` + 这句「请求参数异常」（和「没登录」是同一份响应，`credentials:'omit'`
+发出去一字不差，代码里对过）。这种切回目标页面立刻重来就好：
+
+```
+    [标签页] 当前标签页不在知乎页面上（https://t.bilibili.com/），切回 https://www.zhihu.com/people/kvxjr369f 后重试
+```
+
+`ensure_tab` 也一起修了：它以前只看 `find_tab` 有没有「命中」，而 `find_tab` 是**按站点**
+匹配的（官方文档原话：`kimi.com` 也能命中 `www.kimi.com`，**路径直接忽略**），同一个
+站点的别的页面照样命中，于是当前标签页其实还停在上一页上（上一轮遗留的、上一个源留下
+的）。现在会比对 `find_tab` 回的 url，不是目标页面就自己导航过去：
+
+```
+    [标签页] 命中同站的 https://www.zhihu.com/people/kvxjr369f，导航到 https://www.zhihu.com/people/nell
+```
+
+同站点内的错位不会报错（cookie 照样带得过去），但「打开页面 X」的日志会是假的，而且
+「上一条源是 B 站」这种跨站情况下就会撞上上面那个 403。
+
+**2. 页面是对的，但浏览器这会儿交不出登录 cookie**（前缀 `[登录态]`）。冷启动、
+机器刚唤醒那阵子最常见：Chrome 还没把 cookie 交出来，`document.cookie` 里连
+`SESSIONID` 都没有 —— 请求发出去必然带不上 cookie，同样是那句「请求参数异常」。
+这种切页面、换接口、刷新都没用，只能等，所以脚本会隔 `COOKIE_RETRY_S`（20 秒）看一次，
+最多等 `COOKIE_WAIT_S`（3 分钟；线上实测的失败窗口是 80~125 秒）：
+
+```
+    [登录态] 浏览器里没有知乎的登录 cookie（https://www.zhihu.com/people/kvxjr369f），20s 后再看一次（等浏览器把 cookie 交出来，最多等到 180s 后）
+```
+
+这份耐心同一次运行里所有源共用（记在 bridge 上）：等好了后面的源不用再等，真等不到
+就第一个源等满 3 分钟、其余的立刻失败，不会每个源白等一遍。等满还是不行，多半是
+真没登录了，报错里会提示去浏览器里确认。
 
 ### zhihu · `dedupe_by_content`
 
@@ -1378,6 +1434,76 @@ pin ID。不想要这个行为就把 `dedupe_by_content` 设成 `false`；
 > 阅读器收到一轮「新」条目，之后增量抓取照常。旧版本连同它登记的指纹一起作废，
 > 不用手动清 `state/`。
 
+## 持续归档（滚出窗口的条目不再丢）
+
+`state/<id>.json` 只保留最近 `history` 条 —— 那是给阅读器的**窗口**，条数上限是阅读器
+那边能接受的量级。归档解决的是另一半：**这些条目滚出窗口之后，内容去哪儿了。**
+
+做法是把「本轮从 state 里消失的条目」追加进 `archive/<feed-id>.jsonl`，一直留着。
+RSS 里还是 `history` 那么多条，行为完全不变；变的只是老内容不再随着下一次运行蒸发。
+
+```yaml
+output:
+  archive: true            # 默认开；写 false 关掉（单个源可以用自己的 archive 键覆盖）
+  archive_dir: archive
+  archive_rotate_mb: 100   # 单个文件满 100 MB 就压缩轮转；0 = 不轮转
+```
+
+```
+archive/
+├── bilibili-follow.jsonl            # 还在追加的明文，一行一条，grep 直接用
+├── bilibili-follow.20261002-102002-1.jsonl.gz   # 满 100 MB 压出来的切片
+└── bilibili-follow.20261002-102002-2.jsonl.gz
+```
+
+- **一行一条记录**，明文追加：`{"archived_at": "...", "item": {...}}`，
+  就是 `state` 里那个条目（含 `extra`，知乎的全文也在）。
+- **攒到 `archive_rotate_mb` 就压缩轮转**：当时那份压成
+  `archive/<id>.<时间戳>-<序号>.jsonl.gz`，另起一个空的 `.jsonl` 继续追加。
+  所以正在写的永远是明文（好查好 grep），历史是 gzip（省地方）。
+  `gzip -dc` / `zgrep` 直接能读，攒多少份都不影响后面继续追加。
+- 轮转是**先改名再压缩**（`<id>.jsonl.rotating`）。压缩中途崩了，下次运行会接着压完
+  —— 不会丢，也不会因为重复压缩而多出一份。
+- 归档**不动 `state/`、不动 RSS**，写失败只打一条 stderr，不影响本轮抓取。
+  但它发生在 `state` 已经裁掉之后，所以万一写失败，那一批就是真没了（日志里有 `归档失败`）。
+
+### 哪些条目会进归档
+
+| 离开 state 的原因 | 归档？ |
+|---|---|
+| 被 `history` 挤出窗口（最常见） | ✅ |
+| 被编辑后的新版本取代（知乎 `prune_superseded`） | ✅ 旧版本也留一份 |
+| 正文已经拼进了图片合集（bilibili 合集成员） | ❌ 跳过 —— 内容在合集条目里，合集自己被裁时整份归档 |
+| 被关键词 / `dedupe_by_content` 过滤掉 | ❌ 不进归档，但**还在 state 里**，等它自然滚出窗口时归档 |
+
+最后一条容易误会：过滤只影响 RSS 输出，state 里始终保留全量 —— 所以被过滤的条目
+照样会在滚出窗口时进归档，「过滤」不等于「丢」。
+
+### 怎么看
+
+```bash
+./main.sh archive                                   # 各源概览：文件数 / 体积 / 条数 / 时间范围
+./main.sh archive dump bilibili-follow              # 导出全部历史条目（纯文本）
+./main.sh archive dump bilibili-follow --limit 20   # 只要**最新的** 20 条
+./main.sh archive dump bilibili-follow --grep 关键词 # 标题/正文/链接/作者命中才打印
+./main.sh archive dump bilibili-follow --json       # 输出原始 JSONL，方便自己处理
+```
+
+概览长这样（`./main.sh status` 里也有这一段）：
+
+```
+== 归档（/Users/yangqian/Downloads/local_rss/archive，单个文件满 100 MB 压缩）==
+  bilibili-follow          3 个文件     1.2 MB  3481 条  2025-06-14 ~ 2026-09-28
+  zhihu-kvxjr369f          还没有归档（条目滚出 history 窗口时才会进来）
+```
+
+刚开归档时是**空的**，而且会一直空一阵子 —— 只有真的有条目滚出窗口才有内容进来。
+窗口没满（`state` 里条数 < `history`）时不会有任何条目离开，这一点常被误会成「没生效」。
+
+> 归档和「彻底重来（`rm state/*.json`）」互不影响：删 state 只会让窗口重抓一遍，
+> 已经归档的历史还在。反过来，归档里的条目**不会**被重新塞回 state ——
+> 想捞回来就 `--json` 导出，或者直接看 `.jsonl`。
+
 ## 新增一个网站
 
 1. 在 `localrss/providers/` 下新建 `example.py`，实现 `Provider` 子类并注册：
@@ -1412,7 +1538,11 @@ pin ID。不想要这个行为就把 `dedupe_by_content` 设成 `false`；
 
 - **先让浏览器停在正确的页面**。`evaluate` 作用于「当前标签页」，
   基类的 `setup()` 已经根据 `page_url()` 切好页；如果改用别的页面，记得同步改 `page_url()`。
-  跨域请求会直接 `Failed to fetch`，所以页面和接口必须同源（或接口允许该来源跨域）。
+  页面不对时不止是跨域被拦（`Failed to fetch`）：`SameSite=Lax` 的登录 cookie
+  在跨站请求里根本不会带上，服务器多半只回一句含糊的「参数异常」而不是 401，
+  很难一眼看出是页面没切过去。依赖登录态的 provider 最好在 JS 里自检页面
+  （`location.hostname` / `document.cookie`），像 `zhihu.py` 的 `PAGE_CHECK_JS` 那样
+  把这种情况单独报出来，Python 一侧才知道该重新导航而不是干等重试。
 - **只把需要的字段取回来**。在 JS 里就把响应压成扁平结构再返回，
   不要把原始 JSON 整个搬回来（B 站一页原始数据约 130 KB）。
 - **过滤/去重写在 `postprocess()` 里**，别写在 `fetch()` 里。`fetch()` 只拿到本次新条目，
@@ -1422,6 +1552,11 @@ pin ID。不想要这个行为就把 `dedupe_by_content` 设成 `false`；
   参考 `bilibili.py` 的 `filter_self_repost` 和 `zhihu.py` 的 `dedupe_by_content`。
   丢条目时用 `self.drop_unless(items, keep, reason)`（或直接 `self.note_drop(item, reason)`），
   这样过滤清单日志里也能看到这条是被谁丢的（见「过滤清单」）。
+
+- **造了新条目、而它包含了别的条目的正文**（像 bilibili 的图片合集），
+  顺便覆盖一下 `absorbed_ids(items)`，把那些被包含的 id 报出来。
+  持续归档据此跳过它们 —— 那些条目滚出窗口时内容已经在合集里了，
+  不必再单独归档一份（见「持续归档」）。默认返回空集，不覆盖也没问题。
 
 ## 文件结构
 
@@ -1443,6 +1578,7 @@ local_rss/
 │   ├── config.py            # YAML 解析
 │   ├── models.py            # 统一的 Item 结构
 │   ├── store.py             # 状态与去重
+│   ├── archive.py           # 持续归档：滚出窗口的条目追加 + 满额压缩轮转
 │   ├── feed.py              # RSS 2.0 生成（含 rel="hub" 声明）
 │   ├── websub.py            # WebSub 发布端：内容更新后 ping hub
 │   ├── notify.py            # macOS 通知（有新内容时弹一条）
@@ -1455,6 +1591,7 @@ local_rss/
 │       └── zhihu.py
 ├── output/                  # 生成的 RSS
 ├── state/                   # 每个源一份 JSON（条目 + 跨窗口去重指纹）+ hub.json（WebSub 订阅关系）
+├── archive/                 # 持续归档：每个源一份 .jsonl（+ 满 100 MB 压出来的 .jsonl.gz）
 └── logs/                    # pm2 / launchd / cron 的输出 + <feed-id>.dropped.log 过滤清单
 ```
 
@@ -1485,9 +1622,33 @@ macOS 上关掉最后一个窗口后浏览器进程还在后台跑，`status` �
 **抓到的条数为 0，或接口返回异常** — 多半是浏览器里没登录（或被要求验证）。
 打开页面确认一下，登录后重跑即可。
 
-**知乎返回「请求参数异常，请升级客户端后重试」** — 这是知乎的风控/限频响应，不是代码问题。
-短时间内在同一账号上反复抓取（比如连续手动重跑、或间隔设得太密）就会偶发。
-等几分钟再跑即可，长期就把 `cron_restart` 调到 30 分钟以上。
+**知乎返回「请求参数异常，请升级客户端后重试」** — 三种来源，看日志前缀就能分清：
+
+- 前面带 `[重试] …，15s 后重来` 的：知乎的风控/限频响应（`403` + code `10003`）。
+  短时间内在同一账号上反复抓取（比如连续手动重跑、或间隔设得太密）就会偶发。
+  脚本会就地重试几次（`list_retries`），还不行就等下一个周期。
+- 前面带 `[标签页] …切回…后重试` 的：请求没从知乎页面上发出去（页面还停在别的站点上，
+  `SameSite=Lax` 的登录 cookie 一个都不带）。脚本自己切回页面重来，正常不该再失败；
+  一直失败就翻上去看那行 `[标签页]` 报的到底停在哪个页面上。
+- 前面带 `[登录态] …等浏览器把 cookie 交出来` 的：页面在知乎上，但浏览器这会儿没把
+  登录 cookie 交出来 —— 冷启动、机器刚唤醒最容易碰上，`document.cookie` 里连
+  `SESSIONID` 都没有。脚本会等（最多 3 分钟，线上实测 80~125 秒自己就恢复），
+  不用管；等满还是不行，那多半是真没登录了，去浏览器里确认一下。
+
+**注意这几行日志是打在 stderr 上的**，`./main.sh log` 看的是 `pm2-out.log`（stdout），
+想看它们得翻 `logs/pm2-err.log`。
+
+**想确认到底是不是 cookie 的问题** — WebBridge 自带抓包：在出问题的那个标签页上
+`network start`，复现一次请求，再 `network detail`，看请求头里有没有 `Cookie`
+（正常是几百字节的一大串）。有 Cookie 但还是被拒，那才是知乎那边拦的；没有 Cookie，
+就是浏览器没把登录态交出来。`localrss/bridge.py` 的 `Bridge` 已经能直接调这两个动作：
+
+```python
+b.try_call("network", {"cmd": "start"})
+b.evaluate("fetch('https://www.zhihu.com/api/v3/moments/<token>/activities?offset=0&page_num=1',{credentials:'include'}).then(r=>r.status)")
+reqs = b.try_call("network", {"cmd": "list", "filter": "moments"})["requests"]
+print(b.try_call("network", {"cmd": "detail", "requestId": reqs[0]["requestId"]})["requestHeaders"]["Cookie"])
+```
 
 **跑完 `pm2 list` 显示 `stopped`** — 正常。这是一次性脚本，跑完就该退出，到点会自己再跑。
 
