@@ -806,17 +806,14 @@ class BilibiliProvider(Provider):
             for d in new_digests:
                 print(f"    [动态合集] 合成 {len(d.extra['digest_ids'])} 条：{d.title}")
 
-        if digest_size > 0:
-            # 每次运行都报一下队列：合集是「攒够才发」，不报的话看着就像一直不更新。
+        if digest_size > 0 and pending:
+            # 有在攒的才报队列：合集是「攒够才发」，有队列就该看得见；攒空时没啥可说的
             note = f"在攒 {len(pending)}/{digest_size} 条"
-            if pending:
-                note += f"（还差 {digest_size - len(pending)} 条）"
-                hours = _age_seconds(pending[0].published) / 3600
-                note += f"；最旧一条 {hours:.1f}h 前"
-                note += (f"，满 {max_age_s / 3600:g}h 也会照样发"
-                         if max_age_s > 0 else "，不兜底（攒满才发）")
-            else:
-                note += "，攒满就发"
+            note += f"（还差 {digest_size - len(pending)} 条）"
+            hours = _age_seconds(pending[0].published) / 3600
+            note += f"；最旧一条 {hours:.1f}h 前"
+            note += (f"，满 {max_age_s / 3600:g}h 也会照样发"
+                     if max_age_s > 0 else "，不兜底（攒满才发）")
             print(f"    [动态合集] {note}")
 
         # 头像和播放器在这里加/摘，而不是抓取时定死 —— 这样改开关立刻生效，

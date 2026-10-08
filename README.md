@@ -41,21 +41,19 @@ python3 rss.py --archive-stats # 看持续归档（滚出窗口的老条目存�
 每次运行的结果：
 
 ```
-[bilibili-follow] 打开页面 https://t.bilibili.com/
-[bilibili-follow] 新增 57 条，共 57 条 -> output/bilibili-follow.xml
-[zhihu-kvxjr369f] 打开页面 https://www.zhihu.com/people/kvxjr369f
-[zhihu-kvxjr369f] 新增 35 条，共 35 条 -> output/zhihu-kvxjr369f.xml
+[bilibili-follow] 新增 57 条（共 57 条）-> output/bilibili-follow.xml
+[zhihu-kvxjr369f] 新增 35 条（共 35 条）-> output/zhihu-kvxjr369f.xml
 ```
 
 - 第一次运行会把能翻到的页都抓下来（受 `max_pages` 限制）。
 - 之后是增量的：从第 1 页开始，**整页都是已有记录就停止翻页**，通常几秒钟结束。
-- 抓取时会在浏览器里打开对应页面（归在 `bridge.group_title` 这个标签组下），
-  跑完会自动关掉，详见[标签页清理](#标签页清理)。
-- 有条目滚出 `history` 窗口时会多打一行 `[bilibili-follow] 归档 N 条 -> archive/...`，
+- 汇总行括号里依次是 `共 N 条`（永远有）、`过滤 N 条`、`并入合集 N 条`（后两个大于 0 才出现）。
+  路径是相对当前目录的。标签页的新开/复用细节打在 stderr 上，见[标签页清理](#标签页清理)。
+- 有条目滚出 `history` 窗口时会紧跟源行多打一行 `    [归档] N 条 -> archive/…`，
   RSS 的条数不变，这些内容被永久留下来了，见[持续归档](#持续归档滚出窗口的条目不再丢)。
 - 真的有新条目时，最后会弹一条 macOS 通知（多个源汇总成一条）：
   ```
-  [通知] 已弹出 macOS 通知：2 个源有新内容（bilibili +5 · nell +1）
+  [通知] 2 个源有新内容（bilibili +5 · nell +1）
   ```
 
   没有新内容的那种常见运行不打扰你。不想要的话把 `output.notify` 写成 `false`。
@@ -80,7 +78,8 @@ python3 rss.py --archive-stats # 看持续归档（滚出窗口的老条目存�
 ```
 
 > 被过滤掉的条目（命中了哪个关键词 / 被哪条规则丢的）在 `logs/<feed-id>.dropped.log`
-> 里，每次运行覆盖写，详见「过滤与去重规则 · 过滤清单」。
+> 里，每次运行覆盖写 —— 汇总行只报「过滤 N 条」，这份文件现在是看明细的唯一入口，
+> 详见「过滤与去重规则 · 过滤清单」。
 
 `status` 大概长这样：
 
@@ -410,7 +409,7 @@ UPDATE feed SET ttl = 0 WHERE url LIKE 'http://100.117.207.33:8666/%';
 ```
 
 ```
-[bilibili-follow] 已通知 hub（HTTP 204）：http://100.117.207.33:8666/bilibili-follow.xml
+[bilibili-follow] 已通知 hub（HTTP 204）
 ```
 
 204 就是「收到了」。地址写错或 hub 没起来只会往 stderr 打一条 `WebSub 通知失败：…`，
@@ -443,7 +442,7 @@ pm2 logs local-rss-hub               # hub 侧的验签 / 抓取 / 推送全过�
 跑完（**包括中途失败**）会自动关掉本次开的标签页：
 
 ```
-[清理] 已关闭本次打开的 2 个浏览器标签页
+[清理] 关闭本次打开的 2 个标签页
 ```
 
 只会关掉本 session（`bridge.session`）里的标签页，**不会碰你自己已经打开的 B 站/知乎页面**：
@@ -467,20 +466,20 @@ session，之后 `close_session` 永远够不着，它就成了只能手动关�
 2. 后面的标签页还有个 opener 指向 session 内的标签页，daemon 能按它认领回来
    （日志里的 `[session] local-rss: adopted tab … as borrowed`）；第一个标签页没有，认都认不回来。
 
-复现（修复前的代码，看到「打开页面」后 0.25s 发信号）：
+复现（修复前的代码，等 stderr 上打出 `    [标签页] 新开 https://t.bilibili.com/` 后 0.25s 发信号）：
 
 ```bash
-python3 -u rss.py bilibili-follow &     # -u：否则「打开页面」要等进程退出才落进文件
-# 等它打出「[bilibili-follow] 打开页面 https://t.bilibili.com/」之后：
+python3 rss.py bilibili-follow &        # 锚点在 stderr 上，不需要 -u
+# 等它打出 `    [标签页] 新开 https://t.bilibili.com/`（stderr 不受缓冲影响）之后：
 kill -TERM %1
-# [中断] 收到停止信号，正在清理本次打开的标签页...   ← 没有「已关闭」那行，说明一个都没关掉
+# [中断] 收到停止信号，正在清理本次打开的标签页...   ← 没有「关闭」那行，说明一个都没关掉
 ```
 
 结果 `https://t.bilibili.com/` 就留在浏览器里了，`list_tabs` 看不到、`close_session` 也关不掉：
 
 ```bash
 python3 rss.py --clean
-# [清理] session 'local-rss' 关闭了 0 个标签页
+# [清理] 关闭了 0 个标签页
 ```
 
 **已修**（`cli._setup_signals` + `bridge.Bridge.try_call`）：信号先只置个标记，等当前这次调用
@@ -491,7 +490,7 @@ python3 rss.py --clean
 ```
 [停止] 收到信号 15：等当前这步 WebBridge 调用做完就收尾（再发一次信号可立即强制退出）
 [中断] 收到停止信号，正在清理本次打开的标签页...
-[清理] 已关闭本次打开的 1 个浏览器标签页
+[清理] 关闭本次打开的 1 个标签页
 ```
 
 配套改的是 `ecosystem.config.js` 里的 `kill_timeout: 60000`：pm2 发完信号默认只等 1.6s 就
@@ -507,7 +506,7 @@ pm2 start ecosystem.config.js --only local-rss
 
 ```bash
 python3 rss.py --clean
-# [清理] session 'local-rss' 关闭了 2 个标签页
+# [清理] 关闭了 2 个标签页
 ```
 
 但它只能清掉 **daemon 还记得的** 标签页。浏览器扩展中途重载/重启过、或者调用被砍在半路
@@ -1059,7 +1058,8 @@ data URI 或让本地 `local-rss-http` 代理并缓存，但 feed 会大出好�
 
 ### 过滤清单（`dropped_log`）：丢了哪些、为什么丢
 
-日志里只会说「过滤掉 N 条」，看不出丢的是哪几条。想看明细就把 `output.dropped_log` 打开：
+汇总行里只会说「过滤 N 条」，看不出丢的是哪几条 —— 这份清单就是查明细的唯一入口。
+想看明细就把 `output.dropped_log` 打开：
 
 ```yaml
 output:
@@ -1174,15 +1174,16 @@ provider 拿到的始终是一个合并后的列表。
   就按现有条数照样出一条 —— 免得冷清的时候几条内容永远不出现在 RSS 里。
   设成 `0` 就是「一直攒着，攒够才出」。
 
-每次运行都会报一下队列，攒到哪儿了一眼能看见：
+队列里真有在攒的条目时才报一行，攒到哪儿了一眼能看见（攒空时什么都不打，免得纯噪音）：
 
 ```
   [动态合集] 合成 10 条：动态合集 旋风凉水、特厨魏味-、游戏星GameStar
   [动态合集] 在攒 7/10 条（还差 3 条）；最旧一条 14.8h 前，满 24h 也会照样发
 ```
 
-**「合集怎么不更新」看这一行就够了**：它没坏，只是还在攒 —— 队列没满 N 条，
-最旧那条也还没到兜底时限，所以这一轮不发。队列变慢最常见的原因是关注流里图文/转发
+**「合集怎么不更新」就看有没有这一行**：有 `[动态合集] 在攒 …` 说明它没坏，只是还在攒 ——
+队列没满 N 条，最旧那条也还没到兜底时限，所以这一轮不发；连这一行都没有，说明队列空着，
+这一轮根本没有新的图文/转发动静。队列变慢最常见的原因是关注流里图文/转发
 本来就少；另外「转发自 @自己」会被 `filter_self_repost` 提前丢掉，不进队列
 （它们照样留在 state 里，只是永远不参与合集）。想发得更勤就调
 `image_digest_size`（改小）或 `image_digest_max_age_hours`（改小）—— 都是下次运行生效。
@@ -1306,10 +1307,11 @@ feeds:
 的）。现在会比对 `find_tab` 回的 url，不是目标页面就自己导航过去：
 
 ```
-    [标签页] 命中同站的 https://www.zhihu.com/people/kvxjr369f，导航到 https://www.zhihu.com/people/nell
+    [标签页] 从同站的 https://www.zhihu.com/people/kvxjr369f 导航到 https://www.zhihu.com/people/nell
 ```
 
-同站点内的错位不会报错（cookie 照样带得过去），但「打开页面 X」的日志会是假的，而且
+同站点内的错位不会报错（cookie 照样带得过去），但当前页其实还停在上一页上 —— 现在
+`ensure_tab` 会打出上面那行 `[标签页] 从同站的 … 导航到 …`，让人一眼看得出来；而
 「上一条源是 B 站」这种跨站情况下就会撞上上面那个 403。
 
 **2. 页面是对的，但浏览器这会儿交不出登录 cookie**（前缀 `[登录态]`）。冷启动、
@@ -1543,6 +1545,10 @@ archive/
   很难一眼看出是页面没切过去。依赖登录态的 provider 最好在 JS 里自检页面
   （`location.hostname` / `document.cookie`），像 `zhihu.py` 的 `PAGE_CHECK_JS` 那样
   把这种情况单独报出来，Python 一侧才知道该重新导航而不是干等重试。
+  另外，**本 session 里一个标签页都还没有时别直接 `evaluate`** —— daemon 会回 502
+  （`session "…" has no tab — navigate or find_tab first`），不是回个空结果。要问当前页面
+  就用 `bridge.current_page()`（它先问 `list_tabs`，空 session 直接返回 `{}`），
+  或者先 `ensure_tab()` 把标签页开出来。这个坑在「知乎排在第一个源」时必踩。
 - **只把需要的字段取回来**。在 JS 里就把响应压成扁平结构再返回，
   不要把原始 JSON 整个搬回来（B 站一页原始数据约 130 KB）。
 - **过滤/去重写在 `postprocess()` 里**，别写在 `fetch()` 里。`fetch()` 只拿到本次新条目，
@@ -1612,7 +1618,7 @@ macOS 上关掉最后一个窗口后浏览器进程还在后台跑，`status` �
 浏览器开着窗口、`status` 里 `extension_connected` 也是 `true` 还失败的话，就是扩展本身的问题
 （没装扩展、被禁用，或换过 daemon 端口后没重新指过来），按上面链接排查。
 
-**没收到 macOS 通知** — 先看日志里有没有 `[通知] 已弹出 macOS 通知` 这一行：
+**没收到 macOS 通知** — 先看日志里有没有 `[通知]` 这一行：
 
 - 没有这一行：本轮确实没有新条目（只有真有新增才发），或者 `output.notify` 被关了。
 - 有这一行但还是没看到横幅：多半是系统的**专注模式/勿扰**挡掉了，去

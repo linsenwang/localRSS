@@ -405,11 +405,11 @@ _REUSE_NOTED_ATTR = "zhihu_page_reuse_noted"
 
 
 def _note_page_reuse(bridge: Bridge, page: str) -> None:
+    # 列表接口按 token 取数，不必每个源切页 —— 所以页面上是哪个源都无所谓。
     if getattr(bridge, _REUSE_NOTED_ATTR, False):
         return
     setattr(bridge, _REUSE_NOTED_ATTR, True)
-    print(f"    [页面] 知乎各源共用 {page}（列表接口按 token 取数，不必每个源切页）",
-          file=sys.stderr)
+    print(f"    [页面] 复用知乎标签页 {page}", file=sys.stderr)
 
 
 def _id_from_link(link: str) -> str:
@@ -744,16 +744,21 @@ class ZhihuProvider(Provider):
         列表接口的 token 在 URL 里（`api/v3/moments/<token>/activities`），页面是
         哪个答主的、是不是通知中心，都不影响返回什么 —— 只要页面在 `www.zhihu.com`
         上，请求就是同站的、带得上登录 cookie。所以四个动态源共用一页就够了，
-        不必为了「打开页面 X」这句日志好看每轮多加载四次整页。
+        不必为了日志好看每轮多加载四次整页；复用只报一行 `[页面] 复用知乎标签页 …`。
 
         真正要防的只有跨站那一种：上一条源是 B 站时当前标签页还停在 `t.bilibili.com`
         上（后台标签页，脚本刚把新标签页开出来就跑过来了），那时 fetch 属于跨站，
         `SameSite=Lax` 的登录 cookie 一个都不带，接口只会回「请求参数异常，请升级
         客户端后重试。」（见 PAGE_CHECK_JS 的说明）。所以只有页面不在知乎上时才导航，
         并且等它真的落地 —— navigate 是异步的，返回时新文档未必 commit。
+
+        页面用 `bridge.current_page()` 问，不是直接 evaluate：知乎排在第一个（或者
+        只跑一个知乎源）时本 session 里连一个标签页都还没有，daemon 对空 session 跑
+        evaluate 会直接报错（`has no tab — navigate or find_tab first`），拿不到 href
+        就当「页面不对」处理，然后 ensure_tab 新开一个 —— 那正是这里要的。
         """
         expected = self.page_url()
-        page = bridge.evaluate("({href: location.href, host: location.hostname})") or {}
+        page = bridge.current_page()
         current = str(page.get("href") or "")
         if page.get("host") == "www.zhihu.com":
             if not same_page(current, expected):

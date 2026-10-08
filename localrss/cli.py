@@ -76,6 +76,16 @@ def _feed_url(cfg: Config, feed_cfg) -> str:
     return feed_cfg.filename
 
 
+def _short(path: object) -> str:
+    """日志里的路径：能算成相对当前目录就用相对的，否则原样返回。"""
+    p = Path(path)
+    try:
+        rel = os.path.relpath(p)
+    except ValueError:
+        return str(p)
+    return str(p) if rel.startswith("..") else rel
+
+
 def _archive_for(feed_cfg, cfg: Config) -> Archive | None:
     """这个源要不要归档；返回对应的 Archive（关了则 None）。
 
@@ -113,7 +123,7 @@ def _notify_hub(feed_cfg, cfg: Config) -> bool:
         print(f"[{feed_cfg.id}] WebSub 通知失败：{e}", file=sys.stderr)
         return False
 
-    print(f"[{feed_cfg.id}] 已通知 hub（HTTP {code}）：{url}")
+    print(f"[{feed_cfg.id}] 已通知 hub（HTTP {code}）")
     return True
 
 
@@ -154,7 +164,6 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
         },
     )
 
-    print(f"[{feed_cfg.id}] 打开页面 {provider.page_url()}")
     provider.setup(bridge)
 
     store = Store(cfg.state_dir / f"{feed_cfg.id}.json",
@@ -288,7 +297,7 @@ def cmd_archive_stats(cfg: Config) -> int:
         )
     else:
         rotate = "全局已关闭"
-    print(f"== 归档（{cfg.archive_dir}，{rotate}）==")
+    print(f"== 归档（{_short(cfg.archive_dir)}，{rotate}）==")
     for feed_cfg in cfg.feeds:
         arch = _archive_for(feed_cfg, cfg)
         if arch is None:
@@ -438,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             print("[停止] 清理刚开始就被中断信号打断，本次什么也没关。", file=sys.stderr)
             return 130
         closed, left = bridge.close_session()
-        print(f"[清理] session {cfg.session!r} 关闭了 {closed} 个标签页")
+        print(f"[清理] 关闭了 {closed} 个标签页")
         # 关不掉的（没记进 session 的孤儿标签页）得让用户知道，别以为清干净了
         for tab in left:
             print(f"[清理] 没关掉，需要手动关：{_tab_label(tab)}", file=sys.stderr)
@@ -498,14 +507,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise StopRequested()
             try:
                 r = _run_feed(feed_cfg, cfg, bridge, force=args.force)
-                notes = f"，过滤掉 {r['dropped']} 条" if r["dropped"] else ""
+                extras = [f"共 {r['total']} 条"]
+                if r["dropped"]:
+                    extras.append(f"过滤 {r['dropped']} 条")
                 if r["grouped"]:
-                    notes += f"，{r['grouped']} 条并入合集"
-                print(f"[{feed_cfg.id}] 新增 {r['added']} 条，共 {r['total']} 条{notes} -> {r['path']}")
-                if r["dropped_log"] and r["dropped"]:
-                    print(f"[{feed_cfg.id}] 过滤清单（覆盖写）-> {r['dropped_log']}")
+                    extras.append(f"并入合集 {r['grouped']} 条")
+                print(f"[{feed_cfg.id}] 新增 {r['added']} 条"
+                      f"（{'，'.join(extras)}）-> {_short(r['path'])}")
                 if r["archived"]:
-                    print(f"[{feed_cfg.id}] 归档 {r['archived']} 条 -> {r['archive_path']}")
+                    print(f"    [归档] {r['archived']} 条 -> {_short(r['archive_path'])}")
                 # 有新条目才通知 hub —— hub 收到就来抓 feed 并推给订阅者。
                 # 没有新内容那种常见运行就不打扰它了（通知失败不影响抓取结果）。
                 # derived：本轮没抓到新动态，但 postprocess 自己造了条目（比如攒够
@@ -542,7 +552,7 @@ def main(argv: list[str] | None = None) -> int:
                 # 别让后面发通知（osascript，最长 15s）这段没人杀得动。
                 _setup_signals(stop)
             if closed:
-                print(f"[清理] 已关闭本次打开的 {closed} 个浏览器标签页")
+                print(f"[清理] 关闭本次打开的 {closed} 个标签页")
             for tab in left:
                 print(f"[清理] 没关掉，需要手动关：{_tab_label(tab)}", file=sys.stderr)
 
@@ -554,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
         subtitle = f"{len(news)} 个源有新内容"
         body = " · ".join(news)
         if notify.send("local_rss", body, subtitle):
-            print(f"[通知] 已弹出 macOS 通知：{subtitle}（{body}）")
+            print(f"[通知] {subtitle}（{body}）")
     return 1 if failed else 0
 
 

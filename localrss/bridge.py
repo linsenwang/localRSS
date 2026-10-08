@@ -32,6 +32,16 @@ def same_page(a: str, b: str) -> bool:
     return pa.path.rstrip("/") == pb.path.rstrip("/")
 
 
+def _error_detail(e: urllib.error.HTTPError) -> str:
+    """从 daemon 的错误响应里取出那句话（形如 {"error": {"message": …}}）。"""
+    try:
+        body = json.loads(e.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return f"HTTP {e.code}"
+    message = ((body or {}).get("error") or {}).get("message")
+    return str(message or f"HTTP {e.code}")
+
+
 class BridgeError(RuntimeError):
     """WebBridge 调用失败。"""
 
@@ -82,6 +92,12 @@ class Bridge:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # daemon 用 HTTP 状态码表达错误，body 里仍是 {"ok": false, "error": {…}}
+            # （比如 session 里一个标签页都还没有时，evaluate 回的就是 502，说的是
+            # 「has no tab — navigate or find_tab first」）。当成「连不上 daemon」
+            # 会把人带偏，所以把 body 里那句话取出来。
+            raise BridgeError(f"WebBridge 调用失败: {action} —— {_error_detail(e)}") from e
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
             raise BridgeError(f"无法连接 WebBridge daemon ({self.url}): {e}") from e
 
@@ -147,16 +163,17 @@ class Bridge:
         的 PAGE_CHECK_JS），同站时抓到的是别的页面的数据。
         """
         data = self.try_call("find_tab", {"url": url})
-        if data is not None:
-            current = str(data.get("url") or "")
-            if same_page(current, url):
-                return
-            print(f"    [标签页] 命中同站的 {current}，导航到 {url}", file=sys.stderr)
-        args: dict = {"url": url}
-        # 本 session 里根本没有这个站点的标签页：新开一个，不动用户自己的页面
         if data is None:
-            args["newTab"] = True
-        elif group_title:
+            # 本 session 里根本没有这个站点的标签页：新开一个，不动用户自己的页面
+            print(f"    [标签页] 新开 {url}", file=sys.stderr)
+            self.call("navigate", {"url": url, "newTab": True})
+            return
+        current = str(data.get("url") or "")
+        if same_page(current, url):
+            return
+        print(f"    [标签页] 从同站的 {current} 导航到 {url}", file=sys.stderr)
+        args: dict = {"url": url}
+        if group_title:
             args["group_title"] = group_title
         self.call("navigate", args)
 
@@ -164,6 +181,21 @@ class Bridge:
         """在当前标签页执行 JS，返回其结果。"""
         data = self.call("evaluate", {"code": code})
         return data.get("value")
+
+    def session_tabs(self) -> list[dict]:
+        """本 session 登记着的标签页；还没开过就是空列表。"""
+        return list((self.try_call("list_tabs") or {}).get("tabs") or [])
+
+    def current_page(self) -> dict:
+        """当前标签页的 location（href + hostname）。
+
+        本 session 里一个标签页都还没有时返回空 dict：daemon 对空的 session 跑
+        evaluate 会直接报错（`session "…" has no tab — navigate or find_tab first`，
+        HTTP 502），而不是回个空结果 —— 所以先问一下 list_tabs，别拿它当「页面不对」。
+        """
+        if not self.session_tabs():
+            return {}
+        return self.evaluate("({href: location.href, host: location.hostname})") or {}
 
     def fetch_json(self, url: str, timeout_ms: int = 45000) -> dict:
         """在页面里 fetch 一个 JSON 接口（带 cookie）。"""
