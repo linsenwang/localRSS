@@ -16,7 +16,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from ..bridge import Bridge, same_page
 from ..models import Item, sort_key
@@ -462,6 +462,74 @@ def _strip_noscript(content: str) -> str:
                   flags=re.S | re.I)
 
 
+# ---------- 链接卡片 ----------
+#
+# 正文里贴个外站链接（B 站视频、公众号文章、arXiv…）会渲染成一张卡片：
+# `.RichText-LinkCardContainer > a.LinkCard`。卡片上的标题和简介由知乎的组件
+# **异步**填进去，而实测这个组件在页面上一动不动：卡片滚进视野、等 20 秒、
+# 重新加载都一样，标题/简介两行永远停在 `LinkCard-title loading` 的空壳上，
+# 连一个网络请求都不发（用 web bridge 在真实浏览器里验过）。直接抓 innerHTML
+# 拿到的就是空壳 —— 阅读器里一个 90px 的空白方块，标题和地址全丢了
+# （存量 12 张卡片无一例外，全是这个形态）。
+#
+# 好在要的东西本来就在 DOM 上：标题写在 `<a data-text="...">` 里（作者贴卡片时
+# 填的，不是组件抓来的），地址在 href 上（有的还包着一层
+# `link.zhihu.com/?target=<URL 编码>` 跳转）。所以这里按页面上本该长成的样子
+# 把空壳补上：标题 + 目标地址两行，仍是一个链接。
+_LINK_CARD_RE = re.compile(
+    r'(<a\b[^>]*\bdata-draft-type="link-card"[^>]*>)(.*?)(</a>)', re.S | re.I
+)
+_LINK_CARD_TEXT_RE = re.compile(r'\bdata-(?:text|draft-title)="([^"]*)"', re.I)
+_LINK_CARD_HREF_RE = re.compile(r'\bhref="([^"]*)"', re.I)
+_LINK_CARD_TITLE_RE = re.compile(
+    r'<span\b[^>]*class="[^"]*\bLinkCard-title\b[^"]*"[^>]*>(.*?)</span>', re.S | re.I
+)
+_LINK_ZHIHU_TARGET_RE = re.compile(r'^https?://link\.zhihu\.com/\?target=(.+)$', re.I)
+
+
+def _link_card_target(href: str) -> str:
+    """卡片 href 还原成真实地址：知乎给卡片地址包了一层 link.zhihu.com 跳转。"""
+    m = _LINK_ZHIHU_TARGET_RE.match(href or "")
+    return unquote(m.group(1)) if m else (href or "")
+
+
+def _fix_link_cards(content: str) -> str:
+    """把没填上的链接卡片补成「标题 + 目标地址」。幂等，重复跑没有副作用。"""
+    if not content or "link-card" not in content:
+        return content
+
+    def fix(m: re.Match) -> str:
+        open_tag, inner, close_tag = m.groups()
+        filled = _LINK_CARD_TITLE_RE.search(inner)
+        if filled is not None and filled.group(1).strip():
+            return m.group(0)  # 页面上已经填好了，别动
+        href = _LINK_CARD_HREF_RE.search(open_tag)
+        if href is None:
+            return m.group(0)  # 认不出来，原样留着，别把内容弄丢
+        target = _link_card_target(html.unescape(href.group(1)))
+        if not target:
+            return m.group(0)
+        text = _LINK_CARD_TEXT_RE.search(open_tag)
+        title = html.unescape(text.group(1)).strip() if text else ""
+        # 简介那一行给的是「哪个站点的哪个地址」（页面上就不带协议头）
+        desc = re.sub(r"^https?://", "", target)
+        open_tag = (open_tag[:href.start()]
+                    + f'href="{html.escape(target, quote=True)}"'
+                    + open_tag[href.end():])
+        # 两行之间那个 <br> 是给阅读器用的：知乎页面上这两行是靠 CSS
+        # （`.LinkCard-title` 是 display:-webkit-box）分行的，而阅读器手里没有
+        # 知乎的 CSS，两个 span 会连成一行（`…修理 - bilibili.comwww.bilibili.com/…`）。
+        inner = (
+            '<span class="LinkCard-contents">'
+            f'<span class="LinkCard-title two-line">{html.escape(title or target)}</span>'
+            f'<br><span class="LinkCard-desc">{html.escape(desc)}</span>'
+            '</span>'
+        )
+        return open_tag + inner + close_tag
+
+    return _LINK_CARD_RE.sub(fix, content)
+
+
 # ---------- 公式 ----------
 #
 # 正文里的公式是 `<span class="ztext-math" data-tex="...">`：页面上靠 MathJax 在浏览器里
@@ -574,6 +642,7 @@ def _clean_zhihu_html(content: str) -> str:
         return ""
 
     content = _strip_noscript(content)
+    content = _fix_link_cards(content)
     content = _fix_math(content)
 
     def fix_img(m: re.Match) -> str:
@@ -977,12 +1046,14 @@ class ZhihuProvider(Provider):
             )
         if self.opt("fulltext", True):
             items = self._enrich_fulltext(items, bridge)
-        # 公式换成公式图（见 _fix_math 的说明）。存量条目和全文一样，改抓取逻辑清不掉
-        # 老内容里的 `ztext-math`，所以每轮统一过一遍，幂等。
+        # 公式换成公式图（见 _fix_math 的说明）、空壳链接卡片补上标题（见
+        # _fix_link_cards 的说明）。这两个和全文一样，存量条目的 content 是抓下来
+        # 那一刻存进 state 的，改抓取逻辑清不掉老内容，所以每轮统一过一遍，幂等。
         # 放在最后是有意的：正文指纹按摘要算、算出来就粘住（见 _dedup_key），
         # 这里动 content 不该影响去重结果。
         for item in items:
             item.content = _fix_math(item.content)
+            item.content = _fix_link_cards(item.content)
         return items
 
     # ---------- 编辑 ----------

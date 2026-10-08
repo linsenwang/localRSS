@@ -1006,6 +1006,45 @@ WKWebView 对这种 DOM 全屏支持很差，退出时留下黑色图层。
 > `_strip_noscript()`（幂等，重复跑无副作用），所以带重复图的老条目跑一轮就自己好了。
 > 这点和全文不同 —— 全文抓错了必须删标记重抓（见上），这个只改渲染结果，不依赖重新抓取。
 
+#### 链接卡片在页面上是个空壳
+
+正文里贴一个外站链接（B 站视频、公众号文章、arXiv…）会渲染成一张卡片：
+`.RichText-LinkCardContainer > a.LinkCard`。卡片上的标题和简介由知乎的组件**异步**填，
+而实测这个组件在页面上一动不动：卡片滚进视野、连看 20 秒、重新加载页面都一样，
+那两行永远停在 `LinkCard-title loading` 的空壳上，**连一个网络请求都不发**
+（用 web bridge 在真实浏览器里抓包 + 截图验过）。抓 `innerHTML` 拿到的就是这个空壳：
+
+```html
+<span class="LinkCard-contents"><span class="LinkCard-title loading" data-text="true"></span><span class="LinkCard-desc loading"></span></span>
+```
+
+阅读器里就是一个约 90px 高的空白方块，标题和地址全丢了。存量 12 张卡片无一例外。
+
+要的东西其实本来就在 DOM 上，只是没被渲染出来：
+
+| 要什么 | 在哪儿 |
+| ------ | ------ |
+| 标题 | `<a data-text="...">` 上 —— 作者贴卡片时填的，不是组件抓来的 |
+| 地址 | `href`，有的还包着一层 `link.zhihu.com/?target=<URL 编码>` 跳转 |
+| 简介那一行 | 就是地址去掉协议头（页面上显示的本来就是 `www.bilibili.com/video/BV1514y1V7eY/...`） |
+
+`_fix_link_cards()` 按页面上本该长成的样子把空壳补回来：标题 + 目标地址两行，
+外面还是那个可点的 `<a>`，顺手把 `link.zhihu.com` 那层跳转拆掉（存量的 href 留着的就是它）：
+
+```html
+<div class="RichText-LinkCardContainer"><a target="_blank" href="https://www.bilibili.com/video/BV1514y1V7eY/?spm_id_from=..." data-draft-node="block" data-draft-type="link-card" data-text="水龙头坏了，先不要花钱换新的，师傅教你如何修理 - bilibili.com" class="LinkCard new css-1a2w32z"><span class="LinkCard-contents"><span class="LinkCard-title two-line">水龙头坏了，先不要花钱换新的，师傅教你如何修理 - bilibili.com</span><br><span class="LinkCard-desc">www.bilibili.com/video/BV1514y1V7eY/?spm_id_from=...</span></span></a></div>
+```
+
+那两行之间多出来的 `<br>` 是**给阅读器**的：知乎页面上标题和简介是靠 CSS 分行的
+（`.LinkCard-title` 是 `display:-webkit-box`），阅读器手里没有知乎那份 CSS，两个 `<span>`
+会连成一行（`…修理 - bilibili.comwww.bilibili.com/video/…`），加个 `<br>` 才是页面上那个样子。
+
+已经填好的卡片（组件哪天修好了）、或者连 `href` 都没有的，原样留着，不猜也不丢内容。
+`data-text` 没有的就拿地址当标题 —— 总比留一个空白方块强。
+
+> 存量条目不用手动重置：和 `_strip_noscript()`、`_fix_math()` 一样，`postprocess`
+> 每轮对合并后的全量条目过一遍 `_fix_link_cards()`（幂等），跑一轮就自己好了。
+
 #### 公式（LaTeX）要换成公式图
 
 正文里的公式是 `<span class="ztext-math" data-tex="...">`，页面上靠 MathJax 在浏览器里
@@ -1040,9 +1079,9 @@ TeX 从哪儿取（渲染前后都能拿到，所以抓取时机不再影响结�
 实测改造量：GalAster 441 处、yuhang-liu 65 处、kvxjr369f 6 处（nell 没有），落在 16 条回答上。
 
 > 存量条目不用手动重置：和 `_strip_noscript()` 一样，`postprocess` 每轮都对合并后的全量条目
-> 过一遍 `_fix_math()`（幂等，重复跑无副作用），跑一轮就自己好了。它放在 `postprocess`
-> **最后**是有意的：正文指纹按摘要算、算出来就粘住（见 `_dedup_key`），这里动 content
-> 不该影响去重结果。
+> 过一遍 `_fix_math()`（幂等，重复跑无副作用），跑一轮就自己好了。它和 `_fix_link_cards()`
+> 都放在 `postprocess` **最后**是有意的：正文指纹按摘要算、算出来就粘住（见 `_dedup_key`），
+> 这里动 content 不该影响去重结果。
 
 代价是公式图成了**外链**：知乎那个接口带 `no-store`，缓存不了，公式多的回答一篇就上百张图
 （GalAster 那篇讲逆数学的 148 张），阅读器刷一次相当于发上百个图片请求。想收回来可以内联成
