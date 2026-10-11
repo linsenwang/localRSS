@@ -824,4 +824,24 @@ class BilibiliProvider(Provider):
         for item in items:
             _apply_avatar(item, show_avatar)
             _apply_player(item, style)
+
+        # 正文还带着被接口截断的段落（`_truncated_para` 认得出来）的一律不发：
+        # 半截正文进了阅读器就永久留在那儿（阅读器按 guid 收下，之后我们补上全文
+        # 它也不会刷新，见 README「阅读器那一侧的缓存」）。条目留在 state 里接着补，
+        # 补上再发。放在最后是有意的：合集（extra.kind）要照旧参与合成和记账，
+        # 不能被扣掉 —— 否则下一轮看不到 digest_ids，同一批图片会被重复合成。
+        if self.opt("fulltext", True) and int(self.opt("max_fulltext_per_run", 10)) > 0:
+            self.held_ids = {
+                i.id for i in items
+                if not i.extra.get("kind") and _truncated_para(i) is not None
+            }
+            # 「扣过没」跟着条目存进 state：下一轮补上全文真的发出去时，cli 靠它
+            # 通知 hub、并把这个源计进「新增」（见 cli._run_feed）。
+            for item in items:
+                if item.id in self.held_ids:
+                    item.extra["held"] = True
+            if self.held_ids:
+                items = [i for i in items if i.id not in self.held_ids]
+                print(f"    [全文] {len(self.held_ids)} 条正文还是截断的，"
+                      f"本轮先不发（补上再发）")
         return sorted(items, key=sort_key, reverse=True)

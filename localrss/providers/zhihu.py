@@ -674,6 +674,21 @@ def _rebuild_content(content: str, body: str) -> str:
     return head + (body or "").strip() + tail
 
 
+def _has_fulltext(item: Item) -> bool:
+    """这条的正文是不是「已经拿到全文」，能不能发出去。
+
+    extra.fulltext 单独一个都不够：抓成功（正文换成全文，顺手打上 content_locked）、
+    「页面上本来就没有正文」（问题可以没有描述）、「连页面都定位不了」这三种都会打它，
+    后两种手里的还是接口给的那半截摘要。所以这里认的是 fulltext + content_locked ——
+    只有真把正文换掉的那条路会同时打两个；另外 no_fulltext 是明确的「这条压根没有
+    全文可抓」，那种同样不发。
+    """
+    extra = item.extra
+    if extra.get("no_fulltext"):
+        return False
+    return bool(extra.get("fulltext")) and bool(extra.get("content_locked"))
+
+
 def _link(o: dict) -> str:
     if o.get("target_type") == "answer" and o.get("question_id") and o.get("target_id"):
         return f"https://www.zhihu.com/question/{o['question_id']}/answer/{o['target_id']}"
@@ -1046,6 +1061,28 @@ class ZhihuProvider(Provider):
             )
         if self.opt("fulltext", True):
             items = self._enrich_fulltext(items, bridge)
+            # 全文没到手的**一律不发**（见 _enrich_fulltext 的说明）：动态接口给的
+            # 摘要是平台截断过的半截正文，发出去阅读器就按 guid 收下了，之后我们把
+            # 全文补进 state、feed 也换了，阅读器里那条却不会刷新 —— 残篇就永久留在
+            # 那儿了（换 guid 能逼它重收，但同一篇会在阅读器里变成两条，不值当）。
+            # 所以宁可晚几轮：条目留在 state 里（cli 存的是 merged）接着补，补上再发。
+            #
+            # max_fulltext_per_run <= 0 是「全文这功能关掉」的意思（见 _enrich_fulltext），
+            # 那种情况没有「补完再发」可言，照旧直接发摘要。
+            if int(self.opt("max_fulltext_per_run", 10)) > 0:
+                all_items = items
+                self.held_ids = {i.id for i in all_items if not _has_fulltext(i)}
+                # 「扣过没」要跟着条目存进 state：下一轮补上全文、这条真的进了 RSS 时，
+                # cli 得知道「它是扣过一轮才出来的」，不然既不会通知 hub、也不会计进
+                # 「新增」（它的 id 早就在 state 里了，看起来跟一直在窗口里没两样）。
+                # 摘标记由 cli 做（它才是决定「这轮到底发了什么」的那层），这里只负责记。
+                for i in all_items:
+                    if i.id in self.held_ids:
+                        i.extra["held"] = True
+                if self.held_ids:
+                    items = [i for i in all_items if i.id not in self.held_ids]
+                    print(f"    [全文] {len(self.held_ids)} 条全文还没到手，"
+                          f"本轮先不发（补上再发）")
         # 公式换成公式图（见 _fix_math 的说明）、空壳链接卡片补上标题（见
         # _fix_link_cards 的说明）。这两个和全文一样，存量条目的 content 是抓下来
         # 那一刻存进 state 的，改抓取逻辑清不掉老内容，所以每轮统一过一遍，幂等。
@@ -1108,24 +1145,37 @@ class ZhihuProvider(Provider):
         全文存在 state 里（extra.fulltext 标记），所以每条只会抓一次：
         新增几条就只抓几篇。首次启用时历史条目会按 max_fulltext_per_run
         分批补齐，不会让单次运行卡太久。
+
+        补不完的（配额用完了，或者抓失败了）**不发** —— 这条会一直留在 state 里
+        接着补，直到补上为止，不会退回去发那半截摘要：动态接口给的摘要是平台截断
+        过的正文，发出去阅读器按 guid 收下就再也不刷新了（见 README「阅读器那一侧
+        的缓存」）。要发的 id 记在 held_ids，由 postprocess 那层扣掉。
+        确实**没有**全文可抓的（新的动态类型、没有链接的残条）记 `no_fulltext`：
+        不再重试、也不算进「待补」，但同样不发。
         """
-        pending = [i for i in items if not i.extra.get("fulltext")]
+        pending = [
+            i for i in items
+            if not _has_fulltext(i) and not i.extra.get("no_fulltext")
+        ]
         budget = int(self.opt("max_fulltext_per_run", 10))
 
         if pending:
             print(f"    [全文] 待补 {len(pending)} 篇，本次最多处理 {budget} 篇")
+        if budget <= 0:
+            # 配额关掉了（0）：那就没有「补完再发」这回事，照旧直接发摘要。
+            return items
         todo = pending[:budget]
         for n, item in enumerate(todo, 1):
             item_type = item.extra.get("type", "")
             item_id = _id_from_link(item.link)
             # 连页面都定位不了的：type 不在选择器表里（知乎又出了新类型），或者根本
             # 没有链接 / 从链接里取不出 id —— 早期抓下来的条目里有 type、link 都空着的。
-            # 这种重试多少次都一样。直接按「没有正文可抓」记下，别占着每轮的配额，
-            # 也别让它一直挂在「待补 N 篇」里（否则下面那行失败会每轮打一次）。
+            # 这种重试多少次都一样，标 `no_fulltext` 让它别再占配额、也别每轮报一次
+            # （state 里记着，只打这一次）。但**不发**：手里就是接口给的半截摘要。
             if item_type not in FULLTEXT_SELECTORS or not item_id:
-                item.extra["fulltext"] = True
-                print(f"    [全文] 跳过 {item_type or '(无类型)'} "
-                      f"{item_id or '(无链接)'}：没有可用的页面选择器")
+                item.extra["no_fulltext"] = True
+                print(f"    [全文] {item_type or '(无类型)'} {item_id or '(无链接)'} "
+                      f"没有可用的页面选择器，取不到全文，这条一直不发")
                 continue
             try:
                 # 「添加了问题」这类条目的链接是 api.zhihu.com 的接口地址，
@@ -1134,6 +1184,7 @@ class ZhihuProvider(Provider):
                     bridge, item_type, _web_link(item.link), item_id
                 )
             except Exception as e:
+                # 不标记：下一轮接着补（正文还是半截，所以这一轮不发）。
                 print(f"    [全文] 失败 {item_type}/{item_id}: {e}", file=sys.stderr)
             else:
                 if body:

@@ -65,6 +65,10 @@ class Provider:
         #: 知乎的跨窗口去重要知道「这条已经被新版本取代了」，否则会拿旧版本
         #: 登记的指纹把新版本拦下来。
         self.superseded_ids: set[str] = set()
+        #: 本轮**故意不发**的条目 id：内容还是平台给的那半截、全文又没取到，
+        #: 与其发一条阅读器会按 guid 永久收下的残篇，不如扣在 state 里等下一轮。
+        #: 它们不算「过滤掉」（cli 单独报），下一轮补上全文就正常发出去。
+        self.held_ids: set[str] = set()
 
     def opt(self, key: str, default=None):
         value = self.options.get(key)

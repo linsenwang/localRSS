@@ -71,11 +71,21 @@ class Store:
             old = existing.get(item.id)
             if old is None:
                 added += 1
-            elif old.extra.get("content_locked") and not item.extra.get("content_locked"):
-                # 老条目的 content 是花代价抓来的（比如知乎全文），
-                # 别让本次重新渲染出来的裸摘要把它覆盖回去。
-                item.content = old.content
+            else:
+                # 老条目的 extra 里有我们**后处理攒下的状态**（全文标记、
+                # content_locked、去重指纹、合集成员表…），而抓取侧给的新条目只有
+                # type/verb/updated 这几个。必须并回来：条目的 id 只要还挂在接口上
+                # （知乎动态、B 站动态都这样），它每轮都会被当成「新条目」重抓一次，
+                # 不并的话这些标记就一轮一轮地丢 —— 比如知乎那条「没有页面选择器」
+                # 的残条会每轮重新判定、重打一次日志；扣住没发的条目也会忘记自己
+                # 扣过，补上全文发出去时没人通知 hub。
+                old_locked = bool(old.extra.get("content_locked"))
+                new_locked = bool(item.extra.get("content_locked"))
                 item.extra = {**old.extra, **item.extra}
+                if old_locked and not new_locked:
+                    # 老条目的 content 是花代价抓来的（比如知乎全文），
+                    # 别让本次重新渲染出来的裸摘要把它覆盖回去。
+                    item.content = old.content
             existing[item.id] = item
 
         items = sorted(existing.values(), key=sort_key, reverse=True)[: self.history]

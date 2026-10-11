@@ -192,12 +192,21 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
         store.set_seen_content(provider.published_content)
     # 「过滤掉」只算真被规则丢掉的：被收进图片合集的条数不单条出现，但不是丢了信息
     grouped = provider.grouped_items
-    dropped = len(merged) - len(visible) - grouped
+    # 扣住不发的（全文还没补上，见 zhihu 的 _enrich_fulltext）：不是被规则丢掉的，
+    # 只是这轮先不出现在 RSS 里，所以要跟「过滤掉」分开算。
+    held = len(provider.held_ids)
+    dropped = len(merged) - len(visible) - grouped - held
 
     # 通知里要报的数字：筛选/合集之后**真正进了 RSS 的新条目数**。
     # 不能拿 added（那是抓到的原始条数）：被关键词过滤掉的不算，被并进合集的
     # 单条也不单算（合集自己是一条新条目，会正常算进来）。
     new_visible = sum(1 for item in visible if item.id not in before_ids)
+    # 上一轮因为全文没到手被扣下、这一轮补上才发出来的条目（见 zhihu 的
+    # _enrich_fulltext）：对阅读器来说同样是新内容。它们的 id 早就在 state 里了，
+    # 光看 before_ids 认不出来，所以靠条目上那个 held 标记 —— 在这里摘掉，
+    # 跟着下面 store.save(merged) 一起落盘。
+    released = sum(1 for item in visible if item.extra.pop("held", False))
+    new_visible += released
 
     # 过滤清单：丢了哪些、为什么丢，写一份到 logs/<id>.dropped.log（覆盖写）。
     # 这份文件只为人看，跟 RSS/state 无关，失败也不该让整轮算失败。
@@ -271,6 +280,8 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
         "new_visible": new_visible,
         "dropped": dropped,
         "grouped": grouped,
+        "held": held,
+        "released": released,
         "derived": provider.derived_items,
         "dropped_log": dropped_log_path,
         "archived": archived,
@@ -512,6 +523,10 @@ def main(argv: list[str] | None = None) -> int:
                     extras.append(f"过滤 {r['dropped']} 条")
                 if r["grouped"]:
                     extras.append(f"并入合集 {r['grouped']} 条")
+                if r["held"]:
+                    extras.append(f"另有 {r['held']} 条等全文，本轮不发")
+                if r["released"]:
+                    extras.append(f"补上全文 {r['released']} 条")
                 print(f"[{feed_cfg.id}] 新增 {r['added']} 条"
                       f"（{'，'.join(extras)}）-> {_short(r['path'])}")
                 if r["archived"]:
@@ -520,7 +535,8 @@ def main(argv: list[str] | None = None) -> int:
                 # 没有新内容那种常见运行就不打扰它了（通知失败不影响抓取结果）。
                 # derived：本轮没抓到新动态，但 postprocess 自己造了条目（比如攒够
                 # 或过期后兜底合成的图片合集），RSS 也确实变了，同样要通知。
-                new_count = r["added"] + r["derived"]
+                # released：上一轮被扣住、这一轮补上全文才发出来的（见 _run_feed）。
+                new_count = r["added"] + r["derived"] + r["released"]
                 if new_count:
                     _notify_hub(feed_cfg, cfg)
                     # 通知里报的是筛选/合集之后真正进 RSS 的条数（new_visible），
