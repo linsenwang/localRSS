@@ -201,10 +201,10 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dic
     # 不能拿 added（那是抓到的原始条数）：被关键词过滤掉的不算，被并进合集的
     # 单条也不单算（合集自己是一条新条目，会正常算进来）。
     new_visible = sum(1 for item in visible if item.id not in before_ids)
-    # 上一轮因为全文没到手被扣下、这一轮补上才发出来的条目（见 zhihu 的
-    # _enrich_fulltext）：对阅读器来说同样是新内容。它们的 id 早就在 state 里了，
-    # 光看 before_ids 认不出来，所以靠条目上那个 held 标记 —— 在这里摘掉，
-    # 跟着下面 store.save(merged) 一起落盘。
+    # 上一轮被扣住、这一轮进了 feed 的条目（见 zhihu 的 _publishable /
+    # _enrich_fulltext）：全文补上了，或者确定补不到、不再扣。对阅读器来说同样是新
+    # 内容。它们的 id 早就在 state 里了，光看 before_ids 认不出来，所以靠条目上那个
+    # held 标记 —— 在这里摘掉，跟着下面 store.save(merged) 一起落盘。
     released = sum(1 for item in visible if item.extra.pop("held", False))
     new_visible += released
 
@@ -526,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
                 if r["held"]:
                     extras.append(f"另有 {r['held']} 条等全文，本轮不发")
                 if r["released"]:
-                    extras.append(f"补上全文 {r['released']} 条")
+                    extras.append(f"放出上轮扣住的 {r['released']} 条")
                 print(f"[{feed_cfg.id}] 新增 {r['added']} 条"
                       f"（{'，'.join(extras)}）-> {_short(r['path'])}")
                 if r["archived"]:
@@ -535,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
                 # 没有新内容那种常见运行就不打扰它了（通知失败不影响抓取结果）。
                 # derived：本轮没抓到新动态，但 postprocess 自己造了条目（比如攒够
                 # 或过期后兜底合成的图片合集），RSS 也确实变了，同样要通知。
-                # released：上一轮被扣住、这一轮补上全文才发出来的（见 _run_feed）。
+                # released：上一轮被扣住的、这一轮放出来的（见 _run_feed）。
                 new_count = r["added"] + r["derived"] + r["released"]
                 if new_count:
                     _notify_hub(feed_cfg, cfg)

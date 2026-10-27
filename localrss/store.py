@@ -78,7 +78,7 @@ class Store:
                 # （知乎动态、B 站动态都这样），它每轮都会被当成「新条目」重抓一次，
                 # 不并的话这些标记就一轮一轮地丢 —— 比如知乎那条「没有页面选择器」
                 # 的残条会每轮重新判定、重打一次日志；扣住没发的条目也会忘记自己
-                # 扣过，补上全文发出去时没人通知 hub。
+                # 扣过，放出来时没人通知 hub。
                 old_locked = bool(old.extra.get("content_locked"))
                 new_locked = bool(item.extra.get("content_locked"))
                 item.extra = {**old.extra, **item.extra}

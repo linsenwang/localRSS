@@ -464,9 +464,9 @@ def _digested_ids(items: list[Item]) -> set[str]:
 
 
 def _digest_title(batch: list[Item]) -> str:
-    """合集标题：`动态合集 <作者…>`（同一批发过言的作者全列出来，去重、按时间顺序）。"""
+    """合集标题：`动态合集 <作者…>`（同一批发过言的作者全列出来，去重、从新到旧）。"""
     names: list[str] = []
-    for i in batch:
+    for i in reversed(batch):
         if i.author and i.author not in names:
             names.append(i.author)
     return f"动态合集 {'、'.join(names)}" if names else "动态合集"
@@ -490,19 +490,44 @@ def _digest_entry_html(item: Item, show_avatar: bool) -> str:
     return "<p>" + " · ".join(h for h in head if h) + "</p>" + body
 
 
+#: 合集里每条动态的头行（头像可选、作者链接可选、时间是 `YYYY-MM-DD HH:MM`）。
+#: 用它把旧合集正文切回一条条动态，好把「从旧到新」的老内容改成「从新到旧」。
+_DIGEST_HEAD_SPLIT_RE = re.compile(
+    r'(?=<p>(?:<img [^>]*>)?(?:<a href="[^"]*">)?[^<]*?(?:</a>)?'
+    r' · \d{4}-\d{2}-\d{2} \d{2}:\d{2}</p>)'
+)
+
+
+def _reorder_digest_content(content: str, count: int) -> str | None:
+    """把老合集（从旧到新）的正文反转成从新到旧；切不出 count 段就不动。"""
+    blocks = [b for b in _DIGEST_HEAD_SPLIT_RE.split(content or "") if b]
+    if len(blocks) != count:
+        return None
+    return "".join(reversed(blocks))
+
+
 def _build_digest(batch: list[Item], show_avatar: bool) -> Item:
-    """把一批图片动态（按时间从旧到新）合成一个条目。"""
+    """把一批图片动态（batch 按时间从旧到新）合成一个条目。
+
+    条目正文与标题作者都按**从新到旧**排；batch 保持从旧到新只是为了分批和
+    取 id/link（第一批先发旧的，剩下的继续等）。
+    """
     newest = batch[-1]
     local = batch[0].id.split(":", 1)[-1]  # bilibili:<动态id> -> <动态id>
+    for i in batch:
+        # 成员自己留个标记：万一条目被 history 裁掉、成员还在窗口里，
+        # 下一轮认得出它已经进过合集，不会拿它再合成一条「单条合集」。
+        i.extra["digest_member"] = True
     return Item(
         id=f"bilibili:imgdigest:{local}",
         title=_digest_title(batch),
         link=newest.link or DYNAMIC_URL,
         published=newest.published,
-        content="".join(_digest_entry_html(i, show_avatar) for i in batch),
+        content="".join(_digest_entry_html(i, show_avatar) for i in reversed(batch)),
         extra={
             "kind": IMAGE_DIGEST_KIND,
             "digest_ids": [i.id for i in batch],
+            "newest_first": True,
         },
     )
 
@@ -684,28 +709,53 @@ class BilibiliProvider(Provider):
 
     def _apply_image_digest(
         self, items: list[Item], size: int, max_age_s: float, show_avatar: bool
-    ) -> tuple[list[Item], list[Item], int, list[Item]]:
+    ) -> tuple[list[Item], list[Item], int, list[Item], list[Item]]:
         """把图片动态/转发攒成合集。
 
-        返回（可见列表，本次新建的合集条目，收进合集的条数，还没发出去的存货）。
+        返回（可见列表，本次新建的合集条目，收进合集的条数，还没发出去的存货，
+        兜底时只有 1 条、改成按单条发出的那些）。
 
         - 这些条目自己不进 RSS（没并进合集的在里面等着，并过的也不单独出现）；
-        - 攒够 size 条就出一批（先出旧的）；不足 size 但最旧那条超过 max_age_s 也出一批；
+        - 攒够 size 条就出一批（先出旧的，合集内部再按从新到旧渲染）；
+        - 不足 size 但最旧那条超过 max_age_s：有 2 条以上就照样出一批，
+          只剩 1 条则按普通单条发出 —— 一条的「合集」没有意义，也避免读者看到
+          「动态合集」里孤零零一条；
         - 第四个返回值是发完这批之后还在攒的那些，调用方用来报告队列状态。
         """
         digested = _digested_ids(items)
+        for i in items:
+            # 老合集（这个标记是后加的）也把成员认出来，见 _build_digest。
+            if i.id in digested:
+                i.extra["digest_member"] = True
         image_items = [i for i in items if _item_is_digestable(i)]
-        visible = [i for i in items if not _item_is_digestable(i)]
-        pending = sorted((i for i in image_items if i.id not in digested), key=sort_key)
+        alone = [i for i in image_items if i.extra.get("digest_alone")]
+        visible = [i for i in items if not _item_is_digestable(i)] + alone
+        pending = sorted(
+            (
+                i for i in image_items
+                if i.id not in digested
+                and not i.extra.get("digest_member")
+                and not i.extra.get("digest_alone")
+            ),
+            key=sort_key,
+        )
 
         new: list[Item] = []
         while len(pending) >= size:
             batch, pending = pending[:size], pending[size:]
             new.append(_build_digest(batch, show_avatar))
+        lone: list[Item] = []
         if pending and max_age_s > 0 and _age_seconds(pending[0].published) >= max_age_s:
-            new.append(_build_digest(pending, show_avatar))
-            pending = []  # 这批发完了，不再是「在攒」
-        return visible + new, new, len(image_items), pending
+            if len(pending) == 1:
+                # 一条不值得叫「合集」：按普通单条发出去，下轮不再当成在攒的。
+                pending[0].extra["digest_alone"] = True
+                lone.append(pending[0])
+                visible.append(pending[0])
+            else:
+                new.append(_build_digest(pending, show_avatar))
+            pending = []  # 这批发完了（或者这条单发了），不再是「在攒」
+        grouped = len(image_items) - len(alone) - len(lone)
+        return visible + new, new, grouped, pending, lone
 
     # ---------- 全文 ----------
 
@@ -764,7 +814,11 @@ class BilibiliProvider(Provider):
 
     def absorbed_ids(self, items: list[Item]) -> set[str]:
         """合集成员的正文已经在合集条目里了，它们滚出窗口时不用再单独归档一份。"""
-        return _digested_ids(items)
+        # digest_member 是为了「合集被裁掉、成员还在」的情况：内容已经在（归档里的）
+        # 合集条目中，这里也不该再单独归档一份。
+        return _digested_ids(items) | {
+            i.id for i in items if i.extra.get("digest_member")
+        }
 
     def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
         # items 是 cli 之后要落盘的那个列表（store.save(merged)），
@@ -788,12 +842,13 @@ class BilibiliProvider(Provider):
 
         new_digests: list[Item] = []
         pending: list[Item] = []
+        lone: list[Item] = []
         max_age_s = self._digest_max_age_s()
         if digest_size > 0:
             # 开了合集：图片动态和转发一律进合集，filter_image_only 不再参与
-            items, new_digests, self.grouped_items, pending = self._apply_image_digest(
-                items, digest_size, max_age_s, show_avatar
-            )
+            (
+                items, new_digests, self.grouped_items, pending, lone
+            ) = self._apply_image_digest(items, digest_size, max_age_s, show_avatar)
         elif self.opt("filter_image_only", True):
             items = self.drop_unless(
                 items, lambda i: not _item_is_image_only(i), "纯图动态（filter_image_only）"
@@ -805,6 +860,20 @@ class BilibiliProvider(Provider):
             self.derived_items += len(new_digests)
             for d in new_digests:
                 print(f"    [动态合集] 合成 {len(d.extra['digest_ids'])} 条：{d.title}")
+
+        for i in lone:
+            print(f"    [动态合集] 只剩 1 条，按单条发出：{i.author or i.title}")
+
+        # 老合集是「从旧到新」渲染的：切回一条条动态反转一次，之后不再动。
+        for item in items:
+            if item.extra.get("kind") != IMAGE_DIGEST_KIND or item.extra.get("newest_first"):
+                continue
+            reordered = _reorder_digest_content(
+                item.content, len(item.extra.get("digest_ids") or [])
+            )
+            if reordered is not None:
+                item.content = reordered
+                item.extra["newest_first"] = True
 
         if digest_size > 0 and pending:
             # 有在攒的才报队列：合集是「攒够才发」，有队列就该看得见；攒空时没啥可说的
@@ -825,15 +894,20 @@ class BilibiliProvider(Provider):
             _apply_avatar(item, show_avatar)
             _apply_player(item, style)
 
-        # 正文还带着被接口截断的段落（`_truncated_para` 认得出来）的一律不发：
-        # 半截正文进了阅读器就永久留在那儿（阅读器按 guid 收下，之后我们补上全文
-        # 它也不会刷新，见 README「阅读器那一侧的缓存」）。条目留在 state 里接着补，
-        # 补上再发。放在最后是有意的：合集（extra.kind）要照旧参与合成和记账，
+        # 正文还带着被接口截断的段落（`_truncated_para` 认得出来）、而且**还在重试
+        # 队列里**的一律不发：半截正文进了阅读器就永久留在那儿（阅读器按 guid 收下，
+        # 之后我们补上全文它也不会刷新，见 README「阅读器那一侧的缓存」）。条目留在
+        # state 里接着补，补上再发。已经试过、不会再重试的（`extra.fulltext`：页面在、
+        # 可就是没正文，见 _enrich_fulltext）不在此列 —— 扣下去等不来更好的版本，
+        # 只会让这条永远不进 feed，手里那份摘要照发。
+        # 放在最后是有意的：合集（extra.kind）要照旧参与合成和记账，
         # 不能被扣掉 —— 否则下一轮看不到 digest_ids，同一批图片会被重复合成。
         if self.opt("fulltext", True) and int(self.opt("max_fulltext_per_run", 10)) > 0:
             self.held_ids = {
                 i.id for i in items
-                if not i.extra.get("kind") and _truncated_para(i) is not None
+                if not i.extra.get("kind")
+                and not i.extra.get("fulltext")
+                and _truncated_para(i) is not None
             }
             # 「扣过没」跟着条目存进 state：下一轮补上全文真的发出去时，cli 靠它
             # 通知 hub、并把这个源计进「新增」（见 cli._run_feed）。

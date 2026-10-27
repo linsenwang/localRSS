@@ -675,18 +675,38 @@ def _rebuild_content(content: str, body: str) -> str:
 
 
 def _has_fulltext(item: Item) -> bool:
-    """这条的正文是不是「已经拿到全文」，能不能发出去。
+    """这条的正文是不是**已经换成了全文**。
 
     extra.fulltext 单独一个都不够：抓成功（正文换成全文，顺手打上 content_locked）、
     「页面上本来就没有正文」（问题可以没有描述）、「连页面都定位不了」这三种都会打它，
     后两种手里的还是接口给的那半截摘要。所以这里认的是 fulltext + content_locked ——
-    只有真把正文换掉的那条路会同时打两个；另外 no_fulltext 是明确的「这条压根没有
-    全文可抓」，那种同样不发。
+    只有真把正文换掉的那条路会同时打两个。
     """
     extra = item.extra
     if extra.get("no_fulltext"):
         return False
     return bool(extra.get("fulltext")) and bool(extra.get("content_locked"))
+
+
+def _publishable(item: Item) -> bool:
+    """这条正文能不能进 feed（而不是先扣在 state 里等全文）。
+
+    扣留只在「还有更好的版本在路上」时才有意义：没处理过、也没被判死，下一轮还能
+    补上全文（见 `_enrich_fulltext`）。下面这两种，手里这份就是能拿到的最好版本，
+    再扣就成了**永久不发** —— 条目一直躺在 state 里、每轮都被扣，却等不来任何东西，
+    等于把这条从 feed 里删掉（`zhihu:1791455002_1791403862_44d1cb` 那条视频、
+    5 条 type/link 都空的早期残条就是这么隐形了几个月的）：
+
+    - 已经拿到全文（`_has_fulltext`）；
+    - 明确「没有全文可抓」（`extra.no_fulltext`）：新类型、没有链接的残条。
+      手里那份摘要照发 —— 它可能也是截断的，但「发一份截断的」比「永远不发」
+      强的正是这里：发出去至少看得到，扣着连标题都没有。
+
+    反过来，「处理过但没换成全文」（`fulltext` 有、`content_locked` 没有）**不算**
+    其中：那条还在 `_enrich_fulltext` 的重试名单里（22a4b3e 之前存下的旧状态多半
+    如此），下一轮抓成功能补上，所以照旧扣着。
+    """
+    return _has_fulltext(item) or bool(item.extra.get("no_fulltext"))
 
 
 def _link(o: dict) -> str:
@@ -1061,17 +1081,20 @@ class ZhihuProvider(Provider):
             )
         if self.opt("fulltext", True):
             items = self._enrich_fulltext(items, bridge)
-            # 全文没到手的**一律不发**（见 _enrich_fulltext 的说明）：动态接口给的
-            # 摘要是平台截断过的半截正文，发出去阅读器就按 guid 收下了，之后我们把
-            # 全文补进 state、feed 也换了，阅读器里那条却不会刷新 —— 残篇就永久留在
-            # 那儿了（换 guid 能逼它重收，但同一篇会在阅读器里变成两条，不值当）。
-            # 所以宁可晚几轮：条目留在 state 里（cli 存的是 merged）接着补，补上再发。
+            # 还能补上全文的**先不发**（见 _publishable 和 _enrich_fulltext 的说明）：
+            # 动态接口给的摘要是平台截断过的半截正文，发出去阅读器就按 guid 收下了，
+            # 之后我们把全文补进 state、feed 也换了，阅读器里那条却不会刷新 —— 残篇
+            # 就永久留在那儿了（换 guid 能逼它重收，但同一篇会在阅读器里变成两条，
+            # 不值当）。所以宁可晚几轮：条目留在 state 里（cli 存的是 merged）接着补，
+            # 补上再发。
             #
             # max_fulltext_per_run <= 0 是「全文这功能关掉」的意思（见 _enrich_fulltext），
             # 那种情况没有「补完再发」可言，照旧直接发摘要。
             if int(self.opt("max_fulltext_per_run", 10)) > 0:
                 all_items = items
-                self.held_ids = {i.id for i in all_items if not _has_fulltext(i)}
+                self.held_ids = {
+                    i.id for i in all_items if not _publishable(i)
+                }
                 # 「扣过没」要跟着条目存进 state：下一轮补上全文、这条真的进了 RSS 时，
                 # cli 得知道「它是扣过一轮才出来的」，不然既不会通知 hub、也不会计进
                 # 「新增」（它的 id 早就在 state 里了，看起来跟一直在窗口里没两样）。
@@ -1150,8 +1173,10 @@ class ZhihuProvider(Provider):
         接着补，直到补上为止，不会退回去发那半截摘要：动态接口给的摘要是平台截断
         过的正文，发出去阅读器按 guid 收下就再也不刷新了（见 README「阅读器那一侧
         的缓存」）。要发的 id 记在 held_ids，由 postprocess 那层扣掉。
+
         确实**没有**全文可抓的（新的动态类型、没有链接的残条）记 `no_fulltext`：
-        不再重试、也不算进「待补」，但同样不发。
+        不再重试、也不算进「待补」。但它**照摘要发**（见 `_publishable`）——
+        扣着不会等来全文，只会让这条永远不出现在 feed 里。
         """
         pending = [
             i for i in items
@@ -1171,11 +1196,12 @@ class ZhihuProvider(Provider):
             # 连页面都定位不了的：type 不在选择器表里（知乎又出了新类型），或者根本
             # 没有链接 / 从链接里取不出 id —— 早期抓下来的条目里有 type、link 都空着的。
             # 这种重试多少次都一样，标 `no_fulltext` 让它别再占配额、也别每轮报一次
-            # （state 里记着，只打这一次）。但**不发**：手里就是接口给的半截摘要。
+            # （state 里记着，只打这一次）。手里那份摘要照发（见 `_publishable`）：
+            # 扣着等不来全文，只会让这条永远不出现在 feed 里。
             if item_type not in FULLTEXT_SELECTORS or not item_id:
                 item.extra["no_fulltext"] = True
                 print(f"    [全文] {item_type or '(无类型)'} {item_id or '(无链接)'} "
-                      f"没有可用的页面选择器，取不到全文，这条一直不发")
+                      f"没有可用的页面选择器，取不到全文，照摘要发（不再重试）")
                 continue
             try:
                 # 「添加了问题」这类条目的链接是 api.zhihu.com 的接口地址，
