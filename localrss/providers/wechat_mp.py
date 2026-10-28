@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from ..bridge import Bridge
@@ -243,22 +244,55 @@ def _link(url: str) -> str:
     return url
 
 
-def _articles(content: str) -> list[tuple[str, str]]:
-    """从一个 message_content 里取 (标题, 文章链接)。
+_KEEP_PARAMS = ("__biz", "mid", "idx", "sn")
 
-    一条消息通常只有一个 <appmsg>，多图文推送会拆成多条消息；
-    真遇到一条里塞了多个的，就逐个取。
+
+def _canonical_link(url: str) -> str:
+    """同一篇文章的稳定标识：chksm/scene/xtrack 这些参数会变，不能参与去重。"""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url.split("#", 1)[0]
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    keep = {k: query[k] for k in _KEEP_PARAMS if k in query}
+    if not keep:
+        return url.split("#", 1)[0]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(keep), ""))
+
+
+def _articles(content: str) -> list[tuple[str, str]]:
+    """从一条 appmsg 里取全部 (标题, 文章链接)。
+
+    多图文推送是“一个 <appmsg> 里挂一串 <item>”（界面上显示“余下 N 篇”），
+    不是多条消息；只取 <appmsg> 顶层的 title/url 会漏掉第 2 篇及以后。
     """
     blocks = _RE_APPMSG.findall(content) or [content]
     found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(title: str, url: str) -> None:
+        link = _link(url)
+        key = _canonical_link(link)
+        if link and key not in seen:
+            seen.add(key)
+            found.append((title, link))
 
     for block in blocks:
+        items = re.findall(r"<item>(.*?)</item>", block, re.S)
+        if items:
+            for item in items:
+                url_match = _RE_URL.search(item)
+                if url_match is None:
+                    continue
+                title_match = _RE_TITLE.search(item) or _RE_TITLE_PLAIN.search(item)
+                add(_title(title_match.group(1)) if title_match else "",
+                    url_match.group(1))
+            continue
+
         url_match = _RE_URL.search(block)
         if url_match is None:
             continue
         title_match = _RE_TITLE.search(block) or _RE_TITLE_PLAIN.search(block)
-        title = _title(title_match.group(1)) if title_match else ""
-        found.append((title, _link(url_match.group(1))))
+        add(_title(title_match.group(1)) if title_match else "", url_match.group(1))
     return found
 
 
@@ -445,11 +479,36 @@ class WechatMpProvider(Provider):
         return datetime.now().astimezone() - timedelta(days=days)
 
     def prune_superseded(self, items):
-        """把滚出一周窗口的旧条目从 state 里清掉（它们会照常进 archive）。"""
+        """清掉滚出时间窗口的旧条目，并按文章身份合并重复推送。"""
         cutoff = self._cutoff()
-        if cutoff is None:
-            return items
-        return [i for i in items if i.published is None or i.published >= cutoff]
+        if cutoff is not None:
+            items = [i for i in items if i.published is None or i.published >= cutoff]
+
+        # 同一篇文章被推送两次时 chksm/scene 不同，URL 和 id 都不一样；按
+        # __biz/mid/idx/sn 收敛成一条，优先保留手里有正文的那条。
+        best: dict[str, Item] = {}
+        order: list[str] = []
+        for item in items:
+            key = _canonical_link(item.link) if item.link else item.id
+            kept = best.get(key)
+            if kept is None:
+                best[key] = item
+                order.append(key)
+                continue
+
+            # 优先保留本轮抓到的那条（from_fetch），把旧条目的正文/全文缓存带过去；
+            # 否则保留有正文的。这样旧解析规则留下的另一个链接会收敛到新链接，
+            # 不会每轮都新增一条再归档一条。
+            if item.extra.get("from_fetch") and not kept.extra.get("from_fetch"):
+                if not item.content and kept.content:
+                    item.content = kept.content
+                    for field in ("content_locked", "fulltext", "no_fulltext"):
+                        if kept.extra.get(field):
+                            item.extra[field] = kept.extra[field]
+                best[key] = item
+            elif not kept.content and item.content:
+                best[key] = item
+        return [best[key] for key in order]
 
     def _db_dir(self) -> Path:
         raw = self.require("db_dir")
@@ -504,7 +563,7 @@ class WechatMpProvider(Provider):
         else:
             allowed = set(names)
 
-        items: dict[str, Item] = {}
+        candidates: dict[str, list[tuple[str, str, int, str]]] = {}
         cutoff = self._cutoff()
         min_ts = int(cutoff.timestamp()) if cutoff else None
         for db_path in sorted(message_dir.glob("biz_message_*.db")):
@@ -530,17 +589,34 @@ class WechatMpProvider(Provider):
                         sql += f" and create_time >= {min_ts}"
                     for create_time, raw, compression in con.execute(sql):
                         for title, link in _articles(_decode(raw, compression)):
-                            item_id = "mp-" + hashlib.md5(link.encode()).hexdigest()
-                            old = items.get(item_id)
-                            if old is not None and old.title:
-                                continue
-                            items[item_id] = Item(
-                                id=item_id,
-                                title=title,
-                                link=link,
-                                author=names[username],
-                                published=datetime.fromtimestamp(
-                                    int(create_time)
-                                ).astimezone(),
+                            key = _canonical_link(link)
+                            candidates.setdefault(key, []).append(
+                                (title, link, int(create_time), username)
                             )
+
+        items: dict[str, Item] = {}
+        for key, options in candidates.items():
+            # 同一篇文章被推送多次时 URL 会变（chksm/scene）。优先沿用 state 里
+            # 已有的那条链接（known_ids），否则标题非空里取字典序最小的，保证
+            # 每轮选到同一条，不会反复新增/归档。
+            chosen = next(
+                (
+                    o for o in options
+                    if "mp-" + hashlib.md5(o[1].encode()).hexdigest() in known_ids
+                ),
+                None,
+            )
+            if chosen is None:
+                titled = [o for o in options if o[0]] or options
+                chosen = min(titled, key=lambda o: o[1])
+            title, link, create_time, username = chosen
+            item_id = "mp-" + hashlib.md5(link.encode()).hexdigest()
+            items[key] = Item(
+                id=item_id,
+                title=title,
+                link=link,
+                author=names[username],
+                published=datetime.fromtimestamp(create_time).astimezone(),
+                extra={"from_fetch": True},
+            )
         return list(items.values())
