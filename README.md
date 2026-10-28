@@ -822,7 +822,7 @@ q9adg 回复了回答下你的评论：如何看待“谁善待员工就买谁�
 `rss.py` 不会去连 WebBridge）。图文消息的 `message_content` 是 zstd 压缩的 appmsg
 XML，标题和 URL 都在里面；正文是拿文章链接直接 HTTP 抓的（微信文章页不需要登录），
 只抓 `#js_content` 那一段，去掉内联样式、把懒加载的 `data-src` 换成 `src`，
-正文按条缓存在 state 里，每条只抓一次。
+正文按条缓存在 state 里，每条只抓一次。关键词过滤对公众号只看标题（正文里的广告/引用容易误伤整篇）。
 
 | 键 | 默认 | 说明 |
 |----|------|------|
@@ -831,9 +831,18 @@ XML，标题和 URL 都在里面；正文是拿文章链接直接 HTTP 抓的（
 | `accounts` | — | 可选，只保留这些公众号（`gh_…` 或昵称都认）；不写 = 全部 |
 | `fulltext` | `true` | 抓原文正文；关掉就只留标题 + 链接 |
 | `max_fulltext_per_run` | `30` | 每次最多补几篇正文（首次启用时历史条目分批补齐） |
+| `webview_cache` | `true` | 补“推送过、但消息库里只有会话摘要”的文章；链接从 `Share Data` 缓存取，只认摘要里的标题 |
 | `refresh_db` | — | helper 的路径配置（`python` / `script` / `keys` / `timeout`）；`enabled: false` 时 provider 不自己解密，见下 |
 
-条目 id 是 `mp-<md5(文章链接)>`，同一条文章即使出现在多个数据库副本里也只算一条。
+**有些推送只在 `SessionTable` 里留下摘要，消息行没落盘。** 这时 `biz_message` 里查不到，
+但微信 webview 的 `Share Data` 缓存里还有标题、摘要和 URL（`radium/web/profiles/*/Share Data`）。
+helper 每次会把这些缓存复制到 `<db_dir>/_webview/`；provider **只补标题出现在会话摘要里的文章**
+（也就是确实推送过的），点击过但没推送的不收。正文仍由 fulltext 抓。
+`webview_cache: false` 可以关掉这条兜底。
+
+条目 id 是 `mp-<md5(文章链接)>`，同一条文章即使出现在多个数据库副本里也只算一条：
+去重看的是 `__biz/mid/idx/sn`，`chksm`、`scene`、`xtrack` 这些会变的参数，
+以及推送里 `http://` 和分享缓存里 `https://` 的协议差异都不参与判断。
 文章被发布者删除/违规时页面会明说，这种标 `no_fulltext` 不再重试（标题和链接照发）；
 网络或微信的「环境异常」风控不算永久失败，**这一轮先不放进 RSS**（`held`），
 下一轮补上正文再发 —— 空条目一旦被阅读器按 guid 收下，之后 feed 补上正文也不会刷新
@@ -853,9 +862,10 @@ python3 tools/install_wechat_refresh.py --enable   # 授权后启用
 ```
 
 - 安装目录 `/usr/local/libexec/wechat-refresh/` 全部 root:wheel，用户不可写：
-  helper、`decrypt_db.py`、`wechat_keys.json`、sqlcipher 和 libcrypto 的副本
-- helper 只做一件事：用固定路径执行 `decrypt_db.py --skip-unchanged`，不接受任何参数；
-  Python 用 Apple 的 `/usr/bin/python3`，sqlcipher 指向同目录的 root-owned 副本 ——
+  helper、`refresh_run.py`、`decrypt_db.py`、`wechat_keys.json`、sqlcipher 和 libcrypto 的副本
+- helper 不接受任何参数，用 `/usr/bin/python3` 跑 `refresh_run.py`：先执行
+  `decrypt_db.py --skip-unchanged`，再把两个微信账号 webview 的 `Share Data`
+  复制到 `<db_dir>/_webview/`。Python 和 sqlcipher 都是 root-owned/Apple 的副本 ——
   被 FDA 授权的程序不会执行任何用户可写的代码
 - **RSS 启动时主动触发**：`setup()` 里 `launchctl kickstart` helper，然后等它退出
   （`helper_timeout`，默认 75 秒）才去读库。所以不靠“提前几分钟”碰运气，
@@ -864,6 +874,16 @@ python3 tools/install_wechat_refresh.py --enable   # 授权后启用
 - launchd 另外在每小时的 `:25` / `:55` 兜底跑一次（RSS 在 `:02` / `:32`），
   解密通常 1~3 秒
 - FDA 授权之后不会再弹任何窗，锁屏时也能正常刷新
+- 但 FDA 条目绑的是 helper 的代码签名：它是 ad-hoc 签名，身份就是二进制的 cdhash。
+  重装时如果 cdhash 变了（改了 `wechat_refresh.c`、`refresh_db.timeout`，或安装路径、
+  输出目录变了），旧条目就匹配不上，于是每次运行都退回「想访问其他 App 的数据」弹窗，
+  点“允许”只对那一轮有效。installer 重装时会打印新旧 cdhash 并提醒重新授权；
+  排查时看这条日志有没有 wechat-refresh：
+
+  ```bash
+  log show --last 1h --predicate 'process == "tccd"' 2>/dev/null \
+    | grep -E "Failed to match existing code requirement|SystemPolicyAppData" | grep wechat-refresh
+  ```
 
 **不要给全局的 Homebrew node 加完全磁盘访问权限。** `node` 是所有 node 脚本、
 npm 包、pm2 里其他应用共用的二进制，授权之后任何一段 node 代码都能读你所有受保护

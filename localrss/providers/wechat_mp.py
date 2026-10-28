@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import os
 import random
 import re
@@ -248,15 +249,27 @@ _KEEP_PARAMS = ("__biz", "mid", "idx", "sn")
 
 
 def _canonical_link(url: str) -> str:
-    """同一篇文章的稳定标识：chksm/scene/xtrack 这些参数会变，不能参与去重。"""
-    parts = urlsplit(url)
-    if not parts.query:
-        return url.split("#", 1)[0]
+    """同一篇文章的稳定标识：chksm/scene/xtrack 这些参数会变，不能参与去重。
+
+    `http://` / `https://` 也得归一：推送消息里给的是 http，从分享缓存里
+    拿到的是 https，同一个 sn 会因此被当成两篇文章。
+    """
+    parts = urlsplit(url.strip())
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     keep = {k: query[k] for k in _KEEP_PARAMS if k in query}
-    if not keep:
-        return url.split("#", 1)[0]
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(keep), ""))
+    return urlunsplit(
+        ("https", parts.netloc.lower(), parts.path,
+         urlencode(keep) if keep else parts.query, "")
+    )
+
+
+def _keep_rank(item: Item) -> tuple[bool, bool, bool]:
+    """重复条目里留哪条的优先级：消息库里的 > 本轮抓到的 > 有正文的。"""
+    return (
+        not item.extra.get("webview_only"),
+        bool(item.extra.get("from_fetch")),
+        bool(item.content),
+    )
 
 
 def _articles(content: str) -> list[tuple[str, str]]:
@@ -418,6 +431,10 @@ class WechatMpProvider(Provider):
         )
         print(f"    [微信] 已刷新（{done or '完成'}）")
 
+    def keyword_text(self, item: Item) -> str:
+        # 公众号正文里常夹带抽奖/广告/引用，关键词只看标题，避免误伤整篇文章
+        return item.title or ""
+
     def postprocess(self, items: list[Item], bridge: Bridge | None) -> list[Item]:
         items = super().postprocess(items, bridge)
         if not self.opt("fulltext", True):
@@ -484,8 +501,15 @@ class WechatMpProvider(Provider):
         if cutoff is not None:
             items = [i for i in items if i.published is None or i.published >= cutoff]
 
-        # 同一篇文章被推送两次时 chksm/scene 不同，URL 和 id 都不一样；按
-        # __biz/mid/idx/sn 收敛成一条，优先保留手里有正文的那条。
+        pushed = self._pushed_titles(self._db_dir())
+        items = [
+            i for i in items
+            if not i.extra.get("webview_only")
+            or " ".join((i.title or "").split()) in pushed
+        ]
+
+        # 同一篇文章被推送两次时 chksm/scene（甚至 http/https）不同，URL 和 id
+        # 都不一样；按 __biz/mid/idx/sn 收敛成一条。
         best: dict[str, Item] = {}
         order: list[str] = []
         for item in items:
@@ -496,18 +520,19 @@ class WechatMpProvider(Provider):
                 order.append(key)
                 continue
 
-            # 优先保留本轮抓到的那条（from_fetch），把旧条目的正文/全文缓存带过去；
-            # 否则保留有正文的。这样旧解析规则留下的另一个链接会收敛到新链接，
-            # 不会每轮都新增一条再归档一条。
-            if item.extra.get("from_fetch") and not kept.extra.get("from_fetch"):
-                if not item.content and kept.content:
-                    item.content = kept.content
-                    for field in ("content_locked", "fulltext", "no_fulltext"):
-                        if kept.extra.get(field):
-                            item.extra[field] = kept.extra[field]
-                best[key] = item
-            elif not kept.content and item.content:
-                best[key] = item
+            # 消息库里的那条（非 webview）发布时间才是真正的推送时间，优先保留；
+            # 其次是本轮抓到的（from_fetch），这样旧解析规则留下的另一个链接会
+            # 收敛到新链接，不会每轮都新增一条再归档一条；最后才看有没有正文。
+            winner, loser = (
+                (item, kept) if _keep_rank(item) > _keep_rank(kept) else (kept, item)
+            )
+            # 不管留下哪条，另一条抓到的正文和全文标记都带过去
+            if not winner.content and loser.content:
+                winner.content = loser.content
+                for field in ("content_locked", "fulltext", "no_fulltext"):
+                    if loser.extra.get(field):
+                        winner.extra[field] = loser.extra[field]
+            best[key] = winner
         return [best[key] for key in order]
 
     def _db_dir(self) -> Path:
@@ -535,6 +560,77 @@ class WechatMpProvider(Provider):
                 ):
                     names.setdefault(username, username)
         return names
+
+    def _pushed_titles(self, db_dir: Path) -> set[str]:
+        """会话摘要里的标题 = 真正推送过的文章（brandsessionholder 是订阅号聚合会话）。"""
+        session = db_dir / "session" / "session.db"
+        if not session.exists():
+            return set()
+        nicknames = set(self._accounts(db_dir).values())
+        out: set[str] = set()
+        try:
+            con = sqlite3.connect(f"file:{session}?mode=ro", uri=True)
+            rows = con.execute(
+                "select summary from SessionTable where summary is not null"
+                " and (username = 'brandsessionholder' or username like 'gh_%')"
+            ).fetchall()
+            con.close()
+        except sqlite3.Error:
+            return set()
+        for (summary,) in rows:
+            text = " ".join((summary or "").split())
+            for name in nicknames:
+                prefix = name + ": "
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            if text:
+                out.add(text)
+        return out
+
+    def _webview_articles(self, db_dir: Path, allowed: set[str],
+                          names: dict[str, str], min_ts: int | None,
+                          pushed: set[str]):
+        """从 Share Data 缓存里捞“推送过、但消息库没落盘”的文章（标题须在会话摘要里）。"""
+        cache_dir = db_dir / "_webview"
+        if not cache_dir.is_dir():
+            return []
+        found = []
+        for db in sorted(cache_dir.glob("*.db")):
+            try:
+                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                rows = con.execute(
+                    "select url, real_url, author, share_data from share_data_table"
+                ).fetchall()
+                con.close()
+            except sqlite3.Error:
+                continue
+            for url, real_url, author, blob in rows:
+                if isinstance(blob, str):
+                    blob = blob.encode("utf-8", "ignore")
+                pos = (blob or b"").find(b'{"alias"')
+                if pos < 0:
+                    continue
+                try:
+                    data, _ = json.JSONDecoder().raw_decode(
+                        blob[pos:].decode("utf-8", "ignore")
+                    )
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                username = data.get("userName") or ""
+                if username not in allowed:
+                    continue
+                ts = int(data.get("enterid") or 0)
+                if not ts or (min_ts is not None and ts < min_ts):
+                    continue
+                link = real_url or url or ""
+                if "mp.weixin.qq.com" not in link:
+                    continue
+                title = _title(data.get("title") or data.get("digest") or "")
+                if not title or " ".join(title.split()) not in pushed:
+                    continue
+                found.append((title, link, ts, username))
+        return found
 
     def fetch(self, bridge: Bridge | None, known_ids: set[str]) -> list[Item]:
         if getattr(self, "helper_busy", False):
@@ -594,6 +690,17 @@ class WechatMpProvider(Provider):
                                 (title, link, int(create_time), username)
                             )
 
+        webview_keys: set[str] = set()
+        if self.opt("webview_cache", True):
+            pushed = self._pushed_titles(db_dir)
+            for title, link, ts, username in self._webview_articles(
+                db_dir, allowed, names, min_ts, pushed
+            ):
+                key = _canonical_link(link)
+                if key not in candidates:
+                    candidates[key] = [(title, link, ts, username)]
+                    webview_keys.add(key)
+
         items: dict[str, Item] = {}
         for key, options in candidates.items():
             # 同一篇文章被推送多次时 URL 会变（chksm/scene）。优先沿用 state 里
@@ -611,12 +718,15 @@ class WechatMpProvider(Provider):
                 chosen = min(titled, key=lambda o: o[1])
             title, link, create_time, username = chosen
             item_id = "mp-" + hashlib.md5(link.encode()).hexdigest()
+            extra = {"from_fetch": True}
+            if key in webview_keys:
+                extra["webview_only"] = True
             items[key] = Item(
                 id=item_id,
                 title=title,
                 link=link,
                 author=names[username],
                 published=datetime.fromtimestamp(create_time).astimezone(),
-                extra={"from_fetch": True},
+                extra=extra,
             )
         return list(items.values())

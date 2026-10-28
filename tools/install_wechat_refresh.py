@@ -71,7 +71,7 @@ def build_helper(paths: dict[str, str], dest: Path) -> None:
     cmd = [
         "/usr/bin/clang", "-O2", "-Wall", "-Wextra", "-o", str(dest), str(SOURCE),
         f"-DPYTHON_PATH={c_string('/usr/bin/python3')}",
-        f"-DSCRIPT_PATH={c_string(str(DEST / 'decrypt_db.py'))}",
+        f"-DSCRIPT_PATH={c_string(str(DEST / 'refresh_run.py'))}",
         f"-DKEYS_PATH={c_string(str(DEST / 'wechat_keys.json'))}",
         f"-DOUT_DIR={c_string(paths['out'])}",
         f"-DTIMEOUT_S={paths['timeout']}",
@@ -97,19 +97,32 @@ install_name_tool -change {q(str(LIBCRYPTO))} \
 codesign --force --sign - "$STAGE/lib/libcrypto.3.dylib" >/dev/null 2>&1
 codesign --force --sign - "$STAGE/bin/sqlcipher" >/dev/null 2>&1
 cp {q(str(helper_build))} "$STAGE/wechat-refresh"
+cp {q(paths['wrapper'])} "$STAGE/refresh_run.py"
 
 chown -R root:wheel "$STAGE"
 chmod 755 "$STAGE" "$STAGE/bin" "$STAGE/lib"
-chmod 755 "$STAGE/wechat-refresh" "$STAGE/bin/sqlcipher" "$STAGE/decrypt_db.py"
+chmod 755 "$STAGE/wechat-refresh" "$STAGE/bin/sqlcipher" "$STAGE/decrypt_db.py" "$STAGE/refresh_run.py"
 chmod 644 "$STAGE/wechat_keys.json" "$STAGE/lib/libcrypto.3.dylib"
 rm -rf "$DEST"
 mv "$STAGE" "$DEST"
 """
 
 
+def cdhash(path: Path) -> str:
+    r = subprocess.run(
+        ["codesign", "-d", "--verbose=4", str(path)],
+        capture_output=True, text=True,
+    )
+    for line in (r.stdout + r.stderr).splitlines():
+        if line.startswith("CDHash="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
 def install_system(paths: dict[str, str]) -> None:
     if not SQLCIPHER.exists() or not LIBCRYPTO.exists():
         raise SystemExit("找不到 Homebrew 的 sqlcipher / libcrypto，先 brew install sqlcipher")
+    old_hash = cdhash(HELPER)
     tmp = Path(tempfile.mkdtemp(prefix="wechat-refresh-install-"))
     helper_build = tmp / "wechat-refresh"
     build_helper(paths, helper_build)
@@ -121,6 +134,10 @@ def install_system(paths: dict[str, str]) -> None:
     Path(staged["script"]).write_bytes(Path(paths["script"]).read_bytes())
     Path(staged["keys"]).write_bytes(Path(paths["keys"]).read_bytes())
     Path(staged["keys"]).chmod(0o600)
+    staged["wrapper"] = str(tmp / "wechat_refresh_run.py")
+    Path(staged["wrapper"]).write_bytes(
+        (REPO / "tools" / "wechat_refresh_run.py").read_bytes()
+    )
 
     script = tmp / "install_root.sh"
     script.write_text(root_script(staged, helper_build), encoding="utf-8")
@@ -138,6 +155,19 @@ def install_system(paths: dict[str, str]) -> None:
         # 临时目录里有密钥副本，无论成败都删掉
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"已安装到 {DEST}（root:wheel，用户不可写）")
+    new_hash = cdhash(HELPER)
+    if new_hash:
+        print(f"helper cdhash: {new_hash}")
+    if old_hash and new_hash and old_hash != new_hash:
+        print(
+            "\n⚠ helper 二进制变了（cdhash {} → {}）。\n"
+            "  完全磁盘访问权限里的旧条目绑定的是旧二进制，已经失效：\n"
+            "  不重新添加的话，每次启动都会弹「wechat-refresh 想访问其他 App 的数据」，\n"
+            "  点“允许”也只在那一轮有效。\n"
+            "  去 系统设置 → 隐私与安全性 → 完全磁盘访问权限，删掉旧的 wechat-refresh\n"
+            "  条目，再重新添加下面的文件：\n"
+            "  {}".format(old_hash, new_hash, HELPER)
+        )
 
 
 def write_plist() -> None:
@@ -170,6 +200,8 @@ def set_trigger(value: bool) -> None:
     text = cfg_path.read_text(encoding="utf-8")
     old = "        trigger: false" if value else "        trigger: true"
     new = "        trigger: true" if value else "        trigger: false"
+    if new in text:
+        return
     if old not in text:
         raise SystemExit(f"config.yaml 里找不到 `{old}`，请手动改成 `{new}`")
     cfg_path.write_text(text.replace(old, new, 1), encoding="utf-8")

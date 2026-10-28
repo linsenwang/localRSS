@@ -160,7 +160,12 @@ class Provider:
             items,
             self.common.get("exclude_keywords"),
             on_drop=self.note_drop,
+            text_of=self.keyword_text,
         )
+
+    def keyword_text(self, item: Item) -> str:
+        """关键词过滤看的文本；默认标题 + 正文，正文容易误伤的源可以只给标题。"""
+        return plain_text(item)
 
 
 def plain_text(item: Item) -> str:
@@ -169,7 +174,8 @@ def plain_text(item: Item) -> str:
     return html.unescape(re.sub(r"<[^>]+>", " ", raw))
 
 
-def exclude_by_keywords(items: list[Item], keywords, on_drop=None) -> list[Item]:
+def exclude_by_keywords(items: list[Item], keywords, on_drop=None,
+                        text_of=None) -> list[Item]:
     """丢掉标题或正文命中任一关键词的条目（大小写不敏感的子串匹配）。
 
     on_drop(item, reason) 每丢一条调一次，reason 里带上命中的那个关键词
@@ -183,9 +189,10 @@ def exclude_by_keywords(items: list[Item], keywords, on_drop=None) -> list[Item]
     if not words:
         return items
 
+    text_of = text_of or plain_text
     kept: list[Item] = []
     for item in items:
-        text = plain_text(item).lower()
+        text = text_of(item).lower()
         hit = next((orig for low, orig in words if low in text), None)
         if hit is None:
             kept.append(item)

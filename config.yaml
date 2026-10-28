@@ -247,8 +247,8 @@ feeds:
   # 滚出时间窗口或 history 的条目照常进 archive/wechat-mp.jsonl。
   - id: wechat-mp
     type: wechat_mp
-    title: 微信公众号推送
-    description: 最近一周的公众号文章（标题 + 链接 + 正文）
+    title: 微信公众号
+    description: 最近一周的公众号文章
     site_url: https://mp.weixin.qq.com/
     enabled: true
     history: 300         # 一周通常几十条；留点余量，多出来的按时间裁
@@ -257,6 +257,7 @@ feeds:
       days: 7
       fulltext: true
       max_fulltext_per_run: 30   # 一周十几篇，首轮一次补完
+      webview_cache: true  # 只补会话摘要里出现过的推送文章（链接从 Share Data 缓存取）
       refresh_db:
         enabled: false   # provider 不自己解密；改由专用 helper（见 README）
         helper: /usr/local/libexec/wechat-refresh/wechat-refresh
