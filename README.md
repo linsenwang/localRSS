@@ -830,7 +830,7 @@ XML，标题和 URL 都在里面；正文是拿文章链接直接 HTTP 抓的（
 | `accounts` | — | 可选，只保留这些公众号（`gh_…` 或昵称都认）；不写 = 全部 |
 | `fulltext` | `true` | 抓原文正文；关掉就只留标题 + 链接 |
 | `max_fulltext_per_run` | `30` | 每次最多补几篇正文（首次启用时历史条目分批补齐） |
-| `refresh_db` | — | 可选。读之前先跑 `decrypt_db.py --skip-unchanged`，把微信原始库增量解密到 `db_dir`；见下 |
+| `refresh_db` | — | helper 的路径配置（`python` / `script` / `keys` / `timeout`）；`enabled: false` 时 provider 不自己解密，见下 |
 
 条目 id 是 `mp-<md5(文章链接)>`，同一条文章即使出现在多个数据库副本里也只算一条。
 文章被发布者删除/违规时页面会明说，这种标 `no_fulltext` 不再重试（标题和链接照发）；
@@ -840,19 +840,47 @@ XML，标题和 URL 都在里面；正文是拿文章链接直接 HTTP 抓的（
 滚出 `days` 窗口的旧条目会从 state 里清掉，并按常规进 `archive/wechat-mp.jsonl`。
 
 **定时任务会先刷新数据库。** `wechat_decrypted/` 只是上一次解密出来的快照，
-不刷新的话新推送不会出现。`refresh_db` 就是为这一步准备的：
+不刷新的话新推送不会出现。刷新交给一个**专用 helper**，由 launchd 跑，而不是
+pm2 的 node。因为 macOS 对 CLI 的 App Data 授权不持久（每轮都会重新弹窗），
+helper 装成 root-owned、只给**它自己**完全磁盘访问权限：
 
-```yaml
-refresh_db:
-  python: .../wechat-db-decrypt-macos/.venv/bin/python3
-  script: .../wechat-db-decrypt-macos/decrypt_db.py
-  keys: .../wechat-db-decrypt-macos/wechat_keys.json
+```bash
+python3 tools/install_wechat_refresh.py     # 装到 /usr/local/libexec（会弹管理员密码）
+# 系统设置 → 隐私与安全性 → 完全磁盘访问权限 → + →
+#   /usr/local/libexec/wechat-refresh/wechat-refresh
+python3 tools/install_wechat_refresh.py --enable   # 授权后启用
 ```
 
-`setup()` 里先跑它（`--skip-unchanged`，源库没变的直接跳过，通常 1~3 秒），
-再读 `db_dir`。解密失败不会让整轮失败，会打一条日志、继续用现有数据；
-密钥过期时才需要重新抽 key。这里只做「解密」这一小步，不跑 `unified_export/main.sh`
-的 QQ 导出、Markdown 导出和要点挖掘 —— RSS 用不到那些产物。
+- 安装目录 `/usr/local/libexec/wechat-refresh/` 全部 root:wheel，用户不可写：
+  helper、`decrypt_db.py`、`wechat_keys.json`、sqlcipher 和 libcrypto 的副本
+- helper 只做一件事：用固定路径执行 `decrypt_db.py --skip-unchanged`，不接受任何参数；
+  Python 用 Apple 的 `/usr/bin/python3`，sqlcipher 指向同目录的 root-owned 副本 ——
+  被 FDA 授权的程序不会执行任何用户可写的代码
+- **RSS 启动时主动触发**：`setup()` 里 `launchctl kickstart` helper，然后等它退出
+  （`helper_timeout`，默认 75 秒）才去读库。所以不靠“提前几分钟”碰运气，
+  读到的一定是刚解密完的库；helper 还在写库时这一轮直接不读（返回空），
+  避免读到解密到一半的文件
+- launchd 另外在每小时的 `:25` / `:55` 兜底跑一次（RSS 在 `:02` / `:32`），
+  解密通常 1~3 秒
+- FDA 授权之后不会再弹任何窗，锁屏时也能正常刷新
+
+**不要给全局的 Homebrew node 加完全磁盘访问权限。** `node` 是所有 node 脚本、
+npm 包、pm2 里其他应用共用的二进制，授权之后任何一段 node 代码都能读你所有受保护
+的数据（邮件、信息、Safari、其他 App 的容器）。连「node 想访问微信数据」的
+App Data 授权也覆盖所有 node 进程，不只是这个项目。
+
+`options.refresh_db` 现在只作为 helper 的路径配置（`enabled: false` 让 provider
+不再自己解密）；如果坚持让 provider 自己跑（不装 helper），把 `enabled` 改成
+`true`，但那样又会以 pm2 node 的身份弹 TCC。
+
+卸载 helper：
+
+```bash
+launchctl bootout gui/$(id -u)/com.localrss.wechat-refresh
+rm ~/Library/LaunchAgents/com.localrss.wechat-refresh.plist
+sudo rm -rf /usr/local/libexec/wechat-refresh
+# 再到 完全磁盘访问权限 里把它移除
+```
 
 ### bilibili · `embed_player`
 
@@ -1706,6 +1734,9 @@ local_rss/
 ├── requirements.txt
 ├── deploy/
 │   └── com.localrss.refresh.plist   # launchd 定时任务模板（备选方案）
+├── tools/
+│   ├── wechat_refresh.c            # 微信库专用解密 helper（固定路径，不接受参数）
+│   └── install_wechat_refresh.py   # 编译 helper + 写/加载 LaunchAgent
 ├── localrss/
 │   ├── bridge.py            # WebBridge 客户端（标签页管理 / evaluate / fetch / 清理）
 │   ├── config.py            # YAML 解析

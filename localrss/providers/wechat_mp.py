@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import os
 import random
 import re
 import shutil
@@ -271,7 +272,59 @@ class WechatMpProvider(Provider):
         return "https://mp.weixin.qq.com/"
 
     def setup(self, bridge: Bridge | None) -> None:
+        self.helper_busy = False
         self._refresh_db()
+        self._trigger_helper()
+
+    def _trigger_helper(self) -> None:
+        """让 launchd 里的专用 helper 现在就解密，并等它跑完再读库。
+
+        不依赖“提前几分钟”的对齐：pm2 这边一启动就 kickstart，helper 解完才继续，
+        所以读到的一定是刚刷新过的库。helper 卡住（授权弹窗）时最多等
+        `refresh_db.helper_timeout` 秒，然后本轮不读库（避免读到写了一半的文件）。
+        """
+        cfg = self.opt("refresh_db")
+        if not isinstance(cfg, dict) or not cfg.get("trigger", True):
+            return
+        if cfg.get("enabled", True):
+            # provider 自己已经解密过了，不用再叫 helper
+            return
+
+        helper = Path(
+            str(cfg.get("helper") or "/usr/local/libexec/wechat-refresh/wechat-refresh")
+        ).expanduser()
+        if not helper.exists():
+            print(f"    [微信] 找不到 helper：{helper}（先跑 tools/install_wechat_refresh.py）",
+                  file=sys.stderr)
+            return
+
+        uid = os.getuid()
+        label = "com.localrss.wechat-refresh"
+        subprocess.run(
+            ["launchctl", "kickstart", f"gui/{uid}/{label}"],
+            capture_output=True, text=True,
+        )
+
+        deadline = time.monotonic() + float(cfg.get("helper_timeout") or 75)
+        start = time.monotonic()
+        seen = False
+        while time.monotonic() < deadline:
+            running = subprocess.run(
+                ["pgrep", "-f", str(helper)], capture_output=True
+            ).returncode == 0
+            if running:
+                seen = True
+            elif seen:
+                return
+            elif time.monotonic() - start > 10:
+                print("    [微信] helper 没有启动，继续用现有数据库", file=sys.stderr)
+                return
+            time.sleep(0.3)
+
+        if subprocess.run(["pgrep", "-f", str(helper)], capture_output=True).returncode == 0:
+            print("    [微信] helper 还在解密，本轮先不读库（避免读到写了一半的文件）",
+                  file=sys.stderr)
+            self.helper_busy = True
 
     def _refresh_db(self) -> None:
         """可选：先从微信原始库重新解密一遍，再读。
@@ -287,6 +340,10 @@ class WechatMpProvider(Provider):
             print("    [微信] refresh_db 要写成 python/script/keys 三个键，跳过刷新",
                   file=sys.stderr)
             return
+        if not cfg.get("enabled", True):
+            # 交给 tools/install_wechat_refresh.py 装的 launchd helper 去跑：
+            # 它的 TCC 责任进程是 helper 自己，不会以全局 node 的身份弹窗。
+            return
         python = str(cfg.get("python") or sys.executable)
         script = str(cfg.get("script") or "")
         keys = str(cfg.get("keys") or "")
@@ -298,9 +355,21 @@ class WechatMpProvider(Provider):
             python, script, "--keys", keys,
             "-o", str(self._db_dir()), "--skip-unchanged",
         ]
+        timeout = int(cfg.get("timeout") or 60)
         print("    [微信] 先刷新解密数据库...")
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # 多半是卡在 macOS 的「node 想访问其他 App 的数据」授权弹窗上（锁屏时没人点）。
+            # decrypt_db.py 一开始 glob/stat 微信原始库就会触发 TCC。
+            print(
+                "    [微信] 刷新超时（可能卡在 macOS 的『访问其他 App 的数据』弹窗上）。"
+                "解锁后点一次『允许』即可，授权只覆盖微信的数据；"
+                "不要给全局 node 加完全磁盘访问权限（所有 node 脚本都会继承）。"
+                "本轮先用现有数据库。",
+                file=sys.stderr,
+            )
+            return
         except Exception as e:
             print(f"    [微信] 刷新失败，继续用现有数据库：{e}", file=sys.stderr)
             return
@@ -309,8 +378,11 @@ class WechatMpProvider(Provider):
             print(f"    [微信] 刷新失败（退出码 {proc.returncode}），"
                   f"继续用现有数据库：{detail[-1] if detail else ''}", file=sys.stderr)
             return
-        summary = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-        print(f"    [微信] {summary[-1] if summary else '已刷新'}")
+        done = next(
+            (ln.strip() for ln in reversed(proc.stdout.splitlines()) if "Done:" in ln),
+            "",
+        )
+        print(f"    [微信] 已刷新（{done or '完成'}）")
 
     def postprocess(self, items: list[Item], bridge: Bridge | None) -> list[Item]:
         items = super().postprocess(items, bridge)
@@ -406,6 +478,10 @@ class WechatMpProvider(Provider):
         return names
 
     def fetch(self, bridge: Bridge | None, known_ids: set[str]) -> list[Item]:
+        if getattr(self, "helper_busy", False):
+            # helper 还在写库：这一轮不读，避免读到解密到一半的文件。
+            # 返回空列表 = 不新增条目，feed 继续用 state 里已有的内容。
+            return []
         db_dir = self._db_dir()
         message_dir = db_dir / "message"
         if not message_dir.is_dir():
