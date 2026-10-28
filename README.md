@@ -814,6 +814,46 @@ q9adg 回复了回答下你的评论：如何看待“谁善待员工就买谁�
   会变多但 id 不变 —— 好处是阅读器不会因为多了一个赞就重复提醒，代价是已经收下的
   那条不会跟着刷新（见「阅读器那一侧的缓存」）。
 
+### wechat_mp 的 options
+
+`type: wechat_mp` 读本地解密的微信数据库（`wechat_decrypted/`），把公众号图文消息
+输出成标题 + 链接 + 正文，**不需要浏览器**（`needs_browser = False`，单独跑这个源时
+`rss.py` 不会去连 WebBridge）。图文消息的 `message_content` 是 zstd 压缩的 appmsg
+XML，标题和 URL 都在里面；正文是拿文章链接直接 HTTP 抓的（微信文章页不需要登录），
+只抓 `#js_content` 那一段，去掉内联样式、把懒加载的 `data-src` 换成 `src`，
+正文按条缓存在 state 里，每条只抓一次。
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `db_dir` | — | 必填。解密后的 wechat 目录，下面要有 `contact/`、`session/`、`message/` |
+| `days` | `7` | 只保留最近几天的推送（按消息时间算）；`0` = 不限 |
+| `accounts` | — | 可选，只保留这些公众号（`gh_…` 或昵称都认）；不写 = 全部 |
+| `fulltext` | `true` | 抓原文正文；关掉就只留标题 + 链接 |
+| `max_fulltext_per_run` | `30` | 每次最多补几篇正文（首次启用时历史条目分批补齐） |
+| `refresh_db` | — | 可选。读之前先跑 `decrypt_db.py --skip-unchanged`，把微信原始库增量解密到 `db_dir`；见下 |
+
+条目 id 是 `mp-<md5(文章链接)>`，同一条文章即使出现在多个数据库副本里也只算一条。
+文章被发布者删除/违规时页面会明说，这种标 `no_fulltext` 不再重试（标题和链接照发）；
+网络或微信的「环境异常」风控不算永久失败，**这一轮先不放进 RSS**（`held`），
+下一轮补上正文再发 —— 空条目一旦被阅读器按 guid 收下，之后 feed 补上正文也不会刷新
+（见「阅读器那一侧的缓存」）。
+滚出 `days` 窗口的旧条目会从 state 里清掉，并按常规进 `archive/wechat-mp.jsonl`。
+
+**定时任务会先刷新数据库。** `wechat_decrypted/` 只是上一次解密出来的快照，
+不刷新的话新推送不会出现。`refresh_db` 就是为这一步准备的：
+
+```yaml
+refresh_db:
+  python: .../wechat-db-decrypt-macos/.venv/bin/python3
+  script: .../wechat-db-decrypt-macos/decrypt_db.py
+  keys: .../wechat-db-decrypt-macos/wechat_keys.json
+```
+
+`setup()` 里先跑它（`--skip-unchanged`，源库没变的直接跳过，通常 1~3 秒），
+再读 `db_dir`。解密失败不会让整轮失败，会打一条日志、继续用现有数据；
+密钥过期时才需要重新抽 key。这里只做「解密」这一小步，不跑 `unified_export/main.sh`
+的 QQ 导出、Markdown 导出和要点挖掘 —— RSS 用不到那些产物。
+
 ### bilibili · `embed_player`
 
 视频动态内嵌 B 站官方播放器，可以在阅读器里直接播：
@@ -1619,6 +1659,10 @@ archive/
 
 `providers/` 目录下的模块会被自动导入，不需要改注册表。
 
+如果新源只是读本地文件、不需要浏览器（比如 `wechat_mp.py` 读微信数据库），
+把类属性 `needs_browser` 设成 `False`、`setup()` 留空即可 —— `cli.py` 只会为
+需要浏览器的源创建 Bridge 和调 `check_bridge`，单独跑这类源时 WebBridge 没开也能跑。
+
 写 `fetch` 的两个要点：
 
 - **先让浏览器停在正确的页面**。`evaluate` 作用于「当前标签页」，
@@ -1677,6 +1721,7 @@ local_rss/
 │       ├── __init__.py      # 注册表，自动发现同目录模块
 │       ├── base.py          # Provider 基类
 │       ├── bilibili.py
+│       ├── wechat_mp.py     # 公众号推送（读本地微信数据库，不用浏览器）
 │       └── zhihu.py
 ├── output/                  # 生成的 RSS
 ├── state/                   # 每个源一份 JSON（条目 + 跨窗口去重指纹）+ hub.json（WebSub 订阅关系）

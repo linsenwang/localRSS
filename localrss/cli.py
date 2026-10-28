@@ -154,7 +154,7 @@ def _write_dropped_log(
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _run_feed(feed_cfg, cfg: Config, bridge: Bridge, force: bool = False) -> dict:
+def _run_feed(feed_cfg, cfg: Config, bridge: Bridge | None, force: bool = False) -> dict:
     provider = providers.create(
         feed_cfg.type,
         feed_cfg.options,
@@ -493,18 +493,25 @@ def main(argv: list[str] | None = None) -> int:
                 failed += 1
         return 1 if failed else 0
 
-    bridge = Bridge(
-        url=cfg.bridge_url, session=cfg.session, browser=cfg.browser,
-        stop=stop.is_set,
-    )
-    try:
-        check_bridge(bridge)
-    except BridgeError as e:
-        print(str(e), file=sys.stderr)
-        return 3
-    except StopRequested:
-        print("[停止] 启动阶段收到停止信号，本次不抓取。", file=sys.stderr)
-        return 130
+    # 只有依赖浏览器的源才建 Bridge。读本地文件的源（type 的 needs_browser=False）
+    # 不该因为 WebBridge 没开就整个跑不了 —— 比如只想刷新公众号推送的时候。
+    types = providers.available_types()
+    need_browser = any(getattr(types.get(f.type), "needs_browser", True) for f in feeds)
+
+    bridge = None
+    if need_browser:
+        bridge = Bridge(
+            url=cfg.bridge_url, session=cfg.session, browser=cfg.browser,
+            stop=stop.is_set,
+        )
+        try:
+            check_bridge(bridge)
+        except BridgeError as e:
+            print(str(e), file=sys.stderr)
+            return 3
+        except StopRequested:
+            print("[停止] 启动阶段收到停止信号，本次不抓取。", file=sys.stderr)
+            return 130
 
     close_tabs = cfg.close_session and not args.keep_tabs
     failed = 0
@@ -559,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
         # 收尾：只关掉本 session（本次运行）打开的标签页，用户自己的页面不受影响；
         # daemon 不在线时静默跳过。清理期间忽略信号 —— 第二个信号（pm2 等不及时的
         # SIGKILL 之前那一发）不该把清理打断，否则标签页就漏在浏览器里了。
-        if close_tabs:
+        if close_tabs and bridge is not None:
             _mute_signals()
             try:
                 closed, left = bridge.close_session()

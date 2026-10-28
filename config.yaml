@@ -221,6 +221,38 @@ feeds:
       mode: notifications
       entry_name: all
 
+  # ---- 微信公众号推送 ----
+  #
+  # 从本地解密的微信数据库读公众号图文消息，再用文章链接抓原文正文。
+  # 不需要浏览器/WebBridge，单独跑它时不会去动标签页。
+  #   db_dir                解密后的 wechat 目录（contact/ session/ message/ 要齐）
+  #   days                  只保留最近几天的推送（默认 7）；0 = 不限
+  #   accounts              可选，只保留这些公众号（gh_ 开头或昵称都认）；不写 = 全部
+  #   fulltext              是否抓正文（默认 true）；关掉就只留标题 + 链接
+  #   max_fulltext_per_run  每次最多补几篇（正文缓存在 state 里，每条只抓一次）
+  #   refresh_db            可选：读之前先跑 decrypt_db.py 增量解密（--skip-unchanged），
+  #                         这样定时任务拿到的就是微信里的最新消息，而不是上次导出的快照
+  # 滚出时间窗口或 history 的条目照常进 archive/wechat-mp.jsonl。
+  - id: wechat-mp
+    type: wechat_mp
+    title: 微信公众号推送
+    description: 最近一周的公众号文章（标题 + 链接 + 正文）
+    site_url: https://mp.weixin.qq.com/
+    enabled: true
+    history: 300         # 一周通常几十条；留点余量，多出来的按时间裁
+    options:
+      db_dir: /Users/yangqian/Downloads/unified_export/wechat_decrypted
+      days: 7
+      fulltext: true
+      max_fulltext_per_run: 30   # 一周十几篇，首轮一次补完
+      refresh_db:
+        python: /Users/yangqian/Downloads/wechat/wechat-db-decrypt-macos/.venv/bin/python3
+        script: /Users/yangqian/Downloads/wechat/wechat-db-decrypt-macos/decrypt_db.py
+        keys: /Users/yangqian/Downloads/wechat/wechat-db-decrypt-macos/wechat_keys.json
+      # accounts:
+      #   - 睡前消息编辑部
+      #   - gh_f6f4cc74b1f4     # 橘鸦Juya
+
   # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
   # - id: bilibili-up
   #   type: bilibili

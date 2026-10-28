@@ -38,6 +38,9 @@ class Provider:
     type: str = ""
     #: 该 provider 的说明，用于 `rss.py --list-types`
     description: str = ""
+    #: 是否依赖 WebBridge/浏览器。读本地文件的源设成 False，
+    #: 这样单独跑它时不用把浏览器拉起来，cli 也不会去 check_bridge。
+    needs_browser: bool = True
 
     def __init__(self, options: dict | None = None, common: dict | None = None):
         self.options = dict(options or {})

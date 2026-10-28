@@ -101,7 +101,10 @@ def build_rss(
         published = _rfc822(_updated_at(item) or item.published)
         if published:
             out.append(f"<pubDate>{published}</pubDate>")
-        out.append(f"<description>{_cdata(item.content)}</description>")
+        # 正文为空的源（公众号推送只有标题和链接）就不写这个空壳，
+        # 免得阅读器里每条都多一行空白。
+        if item.content:
+            out.append(f"<description>{_cdata(item.content)}</description>")
         out.append("</item>")
 
     out.append("</channel>")
