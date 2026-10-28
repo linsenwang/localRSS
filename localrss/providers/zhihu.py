@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import html
 import json
@@ -1070,17 +1071,43 @@ class ZhihuProvider(Provider):
         # 所以每次跑都统一过一遍。幂等，重复跑没有副作用。
         for item in items:
             item.content = _strip_noscript(item.content)
+        # 同一条内容出现多个版本（updated 不同）时，这些条目先不过正文去重 ——
+        # 编辑可能发生在接口摘要之外，两版的摘要往往一模一样，交给正文去重会直接
+        # 把新版本吞掉，`_prune_edits` 就没机会比全文。先去重再补全文，最后补一次。
+        versions = (
+            _edit_versions(items) if self.opt("dedupe_by_content", True) else set()
+        )
         if self.opt("dedupe_by_content", True):
+            # 指纹要在补全文之前算好并粘住（见 _dedup_key）：跳过去重的版本条目
+            # 也要带着摘要指纹，最后那轮去重才不会拿全文算出一个对不上的键。
+            for item in items:
+                _dedup_key(item)
             items, self.published_content = _dedupe_by_content(
                 items,
                 seen=self.seen_content,
                 memory_days=self.opt("dedupe_memory_days", 45),
                 on_drop=self.note_drop,
-                # 被新版本取代的旧版本不要再拦新版本（见 _dedupe_by_content）
-                superseded=self.superseded_ids,
+                skip=versions,
             )
         if self.opt("fulltext", True):
             items = self._enrich_fulltext(items, bridge)
+        # 全文到手后再判编辑幅度：要比的是整篇可见文字，不是接口给的那半截摘要。
+        # 「只改了几个字」的版本不进 RSS，旧版本被新版本取代的从 state 里清掉。
+        # 没开全文时 compare 为假，这里退回老行为（新版直接发、旧版清掉）。
+        items = self._prune_edits(items)
+        # 这轮被压下、留在 state 里但不出现在 RSS 的条数（cli 从「过滤掉」里减掉）。
+        # 按 state 里现有的标记数，不是「本轮新压下几条」—— 压下的版本会一直留到
+        # 下一次编辑，只算一次的话后面每轮都会把它误算成「过滤掉」。
+        self.suppressed_edits = sum(
+            1 for i in items if i.extra.get("edit_suppressed")
+        )
+        # 被压下的版本留在 state 里（下一轮接着拿来比），但不进 RSS；
+        # 被新版本取代的旧版本同样不进 RSS（cli 还会把它们从 state 里剔掉）。
+        items = [
+            i for i in items
+            if i.id not in self.pruned_ids and not i.extra.get("edit_suppressed")
+        ]
+        if self.opt("fulltext", True):
             # 还能补上全文的**先不发**（见 _publishable 和 _enrich_fulltext 的说明）：
             # 动态接口给的摘要是平台截断过的半截正文，发出去阅读器就按 guid 收下了，
             # 之后我们把全文补进 state、feed 也换了，阅读器里那条却不会刷新 —— 残篇
@@ -1106,6 +1133,16 @@ class ZhihuProvider(Provider):
                     items = [i for i in all_items if i.id not in self.held_ids]
                     print(f"    [全文] {len(self.held_ids)} 条全文还没到手，"
                           f"本轮先不发（补上再发）")
+        # 版本定下来之后再按正文去重一次：同一篇回答的「回答了问题 / 收藏了
+        # 回答」是两条动态、两个身份，各留一版之后正文会撞在一起，正常只留一条。
+        if versions and self.opt("dedupe_by_content", True):
+            items, self.published_content = _dedupe_by_content(
+                items,
+                seen=self.published_content,
+                memory_days=self.opt("dedupe_memory_days", 45),
+                on_drop=self.note_drop,
+                ignore_owner=True,
+            )
         # 公式换成公式图（见 _fix_math 的说明）、空壳链接卡片补上标题（见
         # _fix_link_cards 的说明）。这两个和全文一样，存量条目的 content 是抓下来
         # 那一刻存进 state 的，改抓取逻辑清不掉老内容，所以每轮统一过一遍，幂等。
@@ -1118,47 +1155,98 @@ class ZhihuProvider(Provider):
 
     # ---------- 编辑 ----------
 
-    def prune_superseded(self, items: list[Item]) -> list[Item]:
-        """丢掉被新版本取代的旧条目。
+    def _prune_edits(self, items: list[Item]) -> list[Item]:
+        """挑出同一条内容里该进 RSS 的那一版。
 
         动态接口只返回内容的**当前版本**（带 updated），所以一条回答被编辑之后，
-        state 里那份旧版本再也不会被刷新 —— 标题和链接还跟新版本一模一样，
-        留着只会白占 history 的位置、在 RSS 里显示成一条重复条目。
+        state 里会同时留着旧版本（旧 id）和新版本。按「同一条内容的身份」
+        （链接 + 动作，见 `_identity`）分组后：
 
-        判据是「同一条内容的身份」（见 `_identity`）里 updated 最大的那份才留。
-        同身份的其它条目分两种，都丢：
+        - 新版本改动**够大**：发新版本，旧版本从 state 里清掉（`pruned_ids`）。
+        - 新版本**只改了几个字**（默认 ≤ 50 字且 ≤ 正文的 5%，见 `_edit_chars`）：
+          不重发，新版本留在 state 里（标 `edit_suppressed`）等下一次编辑再比。
+        - 更早的多个版本一律清掉：每个身份最多留「已发布的一版 + 最新的被压下的一版」。
 
-        - 手里有 updated 但更小的：真·旧版本；
-        - 手里没有 updated 的：加这个字段之前存下来的条目。同身份既然已经有当前
-          版本，它多半就是那条的历史遗留（id 形式换过），一并清掉。
-
-        问题类动态的 target 本来就不带 updated，取到 0，不会命中，原样保留。
+        比较只看可见文字，图片整个不比 —— 知乎图片 CDN 的主机名（pic1 / picx /
+        pica）每次抓都可能换一个，留着它的话**一个字没改**也会被当成编辑。
         """
         if self.mode == MODE_NOTIFICATIONS:
-            # 通知不带 updated（extra.updated 一律 0），这套「留最新版本」的逻辑
-            # 对它没有意义。
-            return items
-        newest: dict[tuple[str, str], int] = {}
-        for item in items:
-            key = _identity(item)
-            updated = int(item.extra.get("updated") or 0)
-            if key and updated > newest.get(key, 0):
-                newest[key] = updated
-        if not newest:
+            # 通知是平台生成的一条条记录，只有当前版本，没有「同一条内容被编辑」
+            # 这回事（extra.updated 一律 0）。
             return items
 
-        kept: list[Item] = []
+        groups: dict[tuple[str, str], list[Item]] = {}
         for item in items:
             key = _identity(item)
-            top = newest.get(key, 0) if key else 0
-            if top and int(item.extra.get("updated") or 0) < top:
-                self.superseded_ids.add(item.id)
+            if key:
+                groups.setdefault(key, []).append(item)
+
+        chars_limit = int(self.opt("edit_ignore_chars", 50))
+        ratio_limit = float(self.opt("edit_ignore_ratio", 0.05))
+        # 没开全文 / 全文配额为 0 时手里只有接口给的半截摘要，比出来的改动量不可信，
+        # 退回老行为：新版本来就发、旧版本清掉。
+        compare = (
+            bool(self.opt("fulltext", True))
+            and int(self.opt("max_fulltext_per_run", 10)) > 0
+        )
+        dropped: set[str] = set()
+
+        for group in groups.values():
+            if len(group) < 2:
                 continue
-            kept.append(item)
+            group.sort(key=lambda i: int(i.extra.get("updated") or 0), reverse=True)
+            newest = group[0]
+            older = group[1:]
+            # 阅读器里那一版 = 比 newest 早、且没被「改得太少」压下的最新一版。
+            # 被压下的版本还在 state 里，但它从没进过 RSS，不能拿它当基准。
+            published = next(
+                (i for i in older if not i.extra.get("edit_suppressed")), None
+            )
 
-        if self.superseded_ids:
-            print(f"    [编辑] 清掉 {len(self.superseded_ids)} 条被新版本取代的旧条目")
-        return kept
+            if newest.extra.get("edit_suppressed") or published is None:
+                # 这版上一轮就判过「改得太少」，或者没有可比的已发布版本：
+                # 当前该发的那版留着，更早的压下版本清掉。
+                winner = published or newest
+            else:
+                if compare and not _publishable(newest):
+                    # 全文还没到手：这轮不判，交给扣留逻辑（下一轮补上再比）。
+                    continue
+                if compare:
+                    old_text = _edit_text(published.content)
+                    changed = _edit_chars(published.content, newest.content)
+                    limit = min(chars_limit, int(len(old_text) * ratio_limit))
+                    if changed <= limit:
+                        newest.extra["edit_suppressed"] = True
+                        # 上轮扣着的标记跟着失效：这版压根不会进 RSS。
+                        newest.extra.pop("held", None)
+                        print(f"    [编辑] {_first_line(newest.title, 40)}："
+                              f"只改了 {changed} 字（正文 {len(old_text)} 字），"
+                              f"不重发")
+                        winner = published
+                    else:
+                        print(f"    [编辑] {_first_line(newest.title, 40)}："
+                              f"改了 {changed} 字，发新版本")
+                        for old in older:
+                            dropped.add(old.id)
+                        continue
+                else:
+                    # 没开全文 / 配额为 0：手里只有摘要，比不了改动大小，
+                    # 退回老行为 —— 新版直接发、旧版本清掉。
+                    for old in older:
+                        dropped.add(old.id)
+                    continue
+
+            # 除了当前这版和「这轮刚被压下的最新版」，更早的版本都可以清掉 ——
+            # state 里每个身份最多留两份，不会随着反复编辑一直长。
+            for old in group:
+                if old is winner or old is newest and old.extra.get("edit_suppressed"):
+                    continue
+                dropped.add(old.id)
+
+        if dropped:
+            self.pruned_ids.update(dropped)
+            print(f"    [编辑] 清掉 {len(dropped)} 条被新版本取代的旧条目")
+        return items
 
     # ---------- 全文 ----------
 
@@ -1350,6 +1438,53 @@ def _identity(item: Item) -> tuple[str, str] | None:
     return (item.link, str(item.extra.get("verb") or ""))
 
 
+def _edit_text(content: str) -> str:
+    """比较编辑幅度用的正文：去掉图片、标签和空白，只留可见文字。
+
+    图片必须整个去掉：知乎图片 CDN 的主机名（pic1 / picx / pica）每次抓都可能
+    换一个，同一个 `v2-…` 图片的地址会跟着变。留着它的话「一个字没改」也会被
+    算成编辑（实测同一篇回答 30 分钟里就换过一轮）。
+    """
+    text = re.sub(r"<img\b[^>]*>", "", content or "", flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\s+", "", html.unescape(text))
+
+
+def _edit_chars(old: str, new: str) -> int:
+    """两个版本之间改动了多少字（插入 + 删除 + 替换里较长的那边）。"""
+    old_text, new_text = _edit_text(old), _edit_text(new)
+    if old_text == new_text:
+        return 0
+    sm = difflib.SequenceMatcher(None, old_text, new_text, autojunk=False)
+    return sum(
+        max(i2 - i1, j2 - j1)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes()
+        if tag != "equal"
+    )
+
+
+def _edit_versions(items: list[Item]) -> set[str]:
+    """同一条内容出现了多个版本（updated 不同）时，返回这些条目的 id。
+
+    它们不能走普通的正文去重：编辑常常发生在接口摘要之外，新旧两版的摘要
+    一模一样 —— 真去重的话新版本会被当成「重复正文」直接吞掉，`_prune_edits`
+    就没机会拿全文比改动大小了。这些条目在补完全文、版本定下来之后再统一去重。
+    """
+    groups: dict[tuple[str, str], list[Item]] = {}
+    for item in items:
+        key = _identity(item)
+        if key:
+            groups.setdefault(key, []).append(item)
+    out: set[str] = set()
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        stamps = {int(i.extra.get("updated") or 0) for i in group}
+        if len(stamps) > 1:
+            out.update(i.id for i in group)
+    return out
+
+
 def _seen_time(value) -> str:
     """指纹表的值是「首次发布时间|发布它的条目 id」；老格式只有时间。"""
     return str(value or "").split("|", 1)[0]
@@ -1382,7 +1517,8 @@ def _dedupe_by_content(
     seen: dict[str, str] | None = None,
     memory_days=45,
     on_drop=None,
-    superseded: set[str] | None = None,
+    skip: set[str] | None = None,
+    ignore_owner: bool = False,
 ) -> tuple[list[Item], dict[str, str]]:
     """正文相同的只保留一条；并把「这条正文已经发出去过」记进指纹表。
 
@@ -1403,16 +1539,22 @@ def _dedupe_by_content(
     返回（保留的条目, 更新后的指纹表）—— 后者由 cli 交回 Store 落盘。
 
     on_drop(item, reason) 每丢一条调一次，给过滤清单日志用。
-    superseded：本轮刚被新版本取代的旧条目 id（见 ZhihuProvider.prune_superseded）。
+    skip：这些 id 不参与本轮去重（同一条内容的新旧版本，留给 `_prune_edits`
+    比全文改动大小；它们的指纹也不在这里登记，否则被压下的那版会把 owner 抢走）。
+    ignore_owner：只做窗口内去重、不查跨窗口的「谁发过」。版本定下来之后的第二轮
+    去重用它 —— 那时指纹表里记的 owner 可能还是被取代的旧版本 id。
     """
     registry = _prune_seen(seen, memory_days)
     now = datetime.now().isoformat(timespec="seconds")
     in_window: set[str] = set()  # 本轮窗口里已经见过的指纹
     published = dict(registry)  # 本轮发出去之后，「已发过」的完整名单
-    superseded = superseded or set()
+    skip = skip or set()
     kept: list[Item] = []
 
     for item in sorted(items, key=sort_key):
+        if item.id in skip:
+            kept.append(item)
+            continue
         key = _dedup_key(item)
         if key is None:
             # 没有正文的（关注了问题等）不参与跨条目去重
@@ -1427,10 +1569,7 @@ def _dedupe_by_content(
         owner = _seen_owner(registry.get(key))
         # 只有「发布者是别人」才拦：发布者就是自己的，说明这条一直在窗口里、
         # 只是又走了一遍，得留着。老格式没记发布者（owner 为空）拿不准，宁可放行。
-        # superseded 里的是刚被新版本取代的旧版本，它登记的指纹也拦不得 ——
-        # 内容被编辑后新旧两版可能撞同一个指纹（编辑没动开头，摘要不变），
-        # 那时拦下来就等于把新版本吞了。
-        if owner and owner != item.id and owner not in superseded:
+        if not ignore_owner and owner and owner != item.id:
             # 双胞胎里已经发过的那条早被裁掉了，只剩这条 —— 别再发一遍
             if on_drop is not None:
                 on_drop(

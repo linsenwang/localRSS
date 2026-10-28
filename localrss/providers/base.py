@@ -64,10 +64,14 @@ class Provider:
         #: 本轮过后「已经发出去过」的指纹表，由用它的 provider 填写；
         #: None = 这个 provider 不用跨窗口去重，cli 就不会覆盖 state 里那份。
         self.published_content: dict[str, str] | None = None
-        #: prune_superseded 丢掉的条目 id，供子类在 postprocess 里参考 ——
-        #: 知乎的跨窗口去重要知道「这条已经被新版本取代了」，否则会拿旧版本
-        #: 登记的指纹把新版本拦下来。
-        self.superseded_ids: set[str] = set()
+        #: postprocess 判定「不该再留在 state 里」的条目 id（目前是知乎被新版本
+        #: 取代的旧版本）。cli 用它把条目从本轮要落盘的 merged 里剔掉 —— 站点上
+        #: 已经没有这一版了，留着只会白占 history 的位置。
+        self.pruned_ids: set[str] = set()
+        #: postprocess 判定「改了没几个字、不值得重发」而留在 state 里、但不进
+        #: RSS 的条目数（见 zhihu 的 `_prune_edits`）。cli 拿它把这类条目从
+        #: 「过滤掉」的条数里减掉 —— 它们不是被规则筛掉的。
+        self.suppressed_edits = 0
         #: 本轮**故意不发**的条目 id：内容还是平台给的那半截、全文又没取到，
         #: 与其发一条阅读器会按 guid 永久收下的残篇，不如扣在 state 里等下一轮。
         #: 它们不算「过滤掉」（cli 单独报）。扣住的只是「下一轮还会再补」的条目，
@@ -132,13 +136,14 @@ class Provider:
         return set()
 
     def prune_superseded(self, items: list[Item]) -> list[Item]:
-        """剔掉已经被新版本取代的旧条目；默认什么都不做。
+        """剔掉不该再留在 state 里的旧条目；默认什么都不做。
 
         由 cli 在「合并进 state 之后、postprocess 之前」调用，所以丢掉的条目
         不会再进 state，也不会出现在 RSS 里。
 
-        知乎那边用它处理编辑：动态接口只返回内容的**当前版本**，被编辑过的旧条目
-        留在 state 里既不会再被刷新，又白占 history 的位置（见 zhihu.py）。
+        公众号那边用它按时间窗口清理（见 wechat_mp.py）。知乎的编辑换代不在这里
+        做 —— 那要先补全文、比改动大小，只能在 postprocess 里（见 zhihu.py 的
+        `_prune_edits`）。
         """
         return items
 

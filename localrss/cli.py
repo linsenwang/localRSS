@@ -182,11 +182,15 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge | None, force: bool = False)
     # 跨窗口的去重指纹：窗口内的对比靠条目本身，窗口外的靠这份表
     # （条目会被 history 裁掉，表不会 —— 见 providers/zhihu.py 的 _dedupe_by_content）
     provider.seen_content = store.seen_content()
-    # 剔掉被新版本取代的旧条目（知乎的编辑，见 Provider.prune_superseded）。
-    # 放在 postprocess 之前：这些条目在站点上已经不存在了，不该再走一遍过滤/补全。
+    # provider 自己的旧条目清理（公众号按时间窗口，见 wechat_mp.prune_superseded）。
+    # 知乎的编辑换代不在这里：要先补全文、比改动大小，见 postprocess 里的 _prune_edits。
     merged = provider.prune_superseded(merged)
-    # 过滤/去重/补全放在合并之后：改规则时存量条目也会被重新筛一遍
+    # 过滤/去重/补全放在合并之后：改规则时存量条目也会被重新筛一遍。
     visible = provider.postprocess(merged, bridge)
+    # 被 postprocess 判定不该留在 state 里的（知乎被新版本取代的旧版本）：
+    # 它们不进 RSS，也不该跟着 store.save 落盘，否则下一轮又会当存量条目处理。
+    if provider.pruned_ids:
+        merged = [i for i in merged if i.id not in provider.pruned_ids]
     # provider 填了新表才覆盖（None = 这个 provider 不玩跨窗口去重）
     if provider.published_content is not None:
         store.set_seen_content(provider.published_content)
@@ -195,7 +199,10 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge | None, force: bool = False)
     # 扣住不发的（全文还没补上，见 zhihu 的 _enrich_fulltext）：不是被规则丢掉的，
     # 只是这轮先不出现在 RSS 里，所以要跟「过滤掉」分开算。
     held = len(provider.held_ids)
-    dropped = len(merged) - len(visible) - grouped - held
+    # 「改了没几个字、不值得重发」而留在 state 里、这轮不进 RSS 的（知乎）。
+    # 它们不是被规则丢掉的，所以要从「过滤掉」里减出去。
+    suppressed = provider.suppressed_edits
+    dropped = len(merged) - len(visible) - grouped - held - suppressed
 
     # 通知里要报的数字：筛选/合集之后**真正进了 RSS 的新条目数**。
     # 不能拿 added（那是抓到的原始条数）：被关键词过滤掉的不算，被并进合集的
@@ -227,8 +234,9 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge | None, force: bool = False)
     store.save(merged)
 
     # 持续归档：把「本轮离开了 state 的条目」追加进 archive/<id>.jsonl。
-    # 离开 state = 被 history 挤出窗口（最常见）、或者被 prune_superseded 换掉的
-    # 旧版本；它们还在上一轮的 before 里，带着当时后处理好的内容（比如知乎全文）。
+    # 离开 state = 被 history 挤出窗口（最常见）、或者被新版本取代的旧版本
+    # （见 zhihu 的 `_prune_edits`）；它们还在上一轮的 before 里，带着当时后处理
+    # 好的内容（比如知乎全文）。
     # 另外补一类极端的：本次抓到、但一进来就被挤出窗口的（history 小 + 一次抓一大批）。
     # 内容已经包含在别的条目里的（bilibili 的合集成员）由 provider 报出来跳过 ——
     # 那不是丢，是换了地方，见 Provider.absorbed_ids。
@@ -281,6 +289,7 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge | None, force: bool = False)
         "dropped": dropped,
         "grouped": grouped,
         "held": held,
+        "suppressed": suppressed,
         "released": released,
         "derived": provider.derived_items,
         "dropped_log": dropped_log_path,
@@ -532,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
                     extras.append(f"并入合集 {r['grouped']} 条")
                 if r["held"]:
                     extras.append(f"另有 {r['held']} 条等全文，本轮不发")
+                if r["suppressed"]:
+                    extras.append(f"{r['suppressed']} 条只改了少量文字，不重发")
                 if r["released"]:
                     extras.append(f"放出上轮扣住的 {r['released']} 条")
                 print(f"[{feed_cfg.id}] 新增 {r['added']} 条"
