@@ -11,6 +11,7 @@
 |------|--------|------|
 | B 站 | `bilibili` | 关注动态（`https://t.bilibili.com/`）或指定 UP 主空间动态 |
 | 知乎 | `zhihu` | 个人主页动态（`https://www.zhihu.com/people/<token>`）或通知中心（`https://www.zhihu.com/notifications`） |
+| 晚点LatePost | `latepost` | 最新报道（`https://www.latepost.com/news`），直连站点，不需要浏览器 |
 
 ## 前置条件
 
@@ -814,6 +815,29 @@ q9adg 回复了回答下你的评论：如何看待“谁善待员工就买谁�
   **合并**（多人点赞同一条评论合成一条，`merge_count` 从 1 变 2、3…），合并后 actors
   会变多但 id 不变 —— 好处是阅读器不会因为多了一个赞就重复提醒，代价是已经收下的
   那条不会跟着刷新（见「阅读器那一侧的缓存」）。
+
+### latepost 的 options
+
+`type: latepost` 抓晚点LatePost 的最新报道，**不需要浏览器**（`needs_browser = False`）。
+列表走站点自己的接口 `POST /news/get-news-data`，详情页是服务端渲染的，正文直接从
+`#select-main` 里取；每条只抓一次详情，全文随条目存进 state。文章 id 看起来是连续
+递增的，但按 id 扫得先知道最新起点、还要跳过空号；列表接口直接给时间序和标题摘要，
+翻页也更稳。
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `programa` | `0` | `0` 全部；`1` 晚点独家；`2` 人物对话；`4` 长报道 |
+| `max_pages` | `3` | 首轮最多翻几页；之后整页都见过就停 |
+| `limit` | `20` | 每页条数 |
+| `fulltext` | `true` | 抓详情页全文；`false` 只留列表里的标题 + 摘要 |
+| `delay_s` | `0.3` | 每抓一篇全文之间歇一下（秒） |
+| `tls_verify` | `auto` | `auto`：先正常校验，证书链验不过时退回不校验并打一行警告；`true`：严格校验；`false`：不校验 |
+| `ca_file` | 空 | 指定 CA PEM（比如补上 Let's Encrypt 的 ISRG Root YR） |
+| `timeout` | `30` | 单次 HTTP 超时（秒） |
+
+站点当前用 Let's Encrypt 新一代 YR2 中间证书，根证书 `ISRG Root YR` 可能还不在
+本机 CA 库里，标准校验会报 `unable to get local issuer certificate`。`auto` 只在
+这种情况下退回不校验（只读公开新闻，不涉及登录态）；装好根证书后建议改成 `true`。
 
 ### wechat_mp 的 options
 
@@ -1783,6 +1807,7 @@ local_rss/
 │       ├── __init__.py      # 注册表，自动发现同目录模块
 │       ├── base.py          # Provider 基类
 │       ├── bilibili.py
+│       ├── latepost.py      # 晚点LatePost（直连站点，不用浏览器）
 │       ├── wechat_mp.py     # 公众号推送（读本地微信数据库，不用浏览器）
 │       └── zhihu.py
 ├── output/                  # 生成的 RSS

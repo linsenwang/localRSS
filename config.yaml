@@ -271,6 +271,34 @@ feeds:
       #   - 睡前消息编辑部
       #   - gh_f6f4cc74b1f4     # 橘鸦Juya
 
+  # ---- 晚点LatePost（直连站点，不需要浏览器）----
+  #
+  # 列表走站点自己的接口 /news/get-news-data，详情页是服务端渲染的，正文直接
+  # 从 HTML 里取。不需要登录。文章 id 虽然看起来连续，但按 id 扫要先知道最新
+  # 起点、还要处理空号，列表接口更稳。
+  #   programa: 0              0 = 全部；1 = 晚点独家；2 = 人物对话；4 = 长报道
+  #   max_pages: 3             首轮最多翻几页（每页 limit 条），之后整页都见过就停
+  #   limit: 20                每页条数
+  #   fulltext: true           抓详情页全文；关掉就只留列表里的标题 + 摘要
+  #   delay_s: 0.3             每抓一篇全文之间歇一下（秒），别把站点打急了
+  #   tls_verify: auto         先正常校验证书；本机 CA 库缺 Let's Encrypt 的
+  #                            ISRG Root YR 时会退回不校验并打一行警告。装了
+  #                            根证书后写 true；也可以用 ca_file 指定 PEM。
+  - id: latepost
+    type: latepost
+    title: 晚点LatePost
+    description: 晚点LatePost 最新报道
+    site_url: https://www.latepost.com/news
+    enabled: true
+    history: 80          # 带全文，每篇约 10~20 KB；80 篇约 1 MB
+    options:
+      programa: 0
+      max_pages: 3
+      limit: 20
+      fulltext: true
+      delay_s: 0.3
+      tls_verify: auto
+
   # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
   # - id: bilibili-up
   #   type: bilibili
