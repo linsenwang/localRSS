@@ -56,11 +56,35 @@ ensure_webbridge() {
 
 ensure_webbridge || exit 1
 
+# local_rss 写完 feed 并通知 hub 后，FreshRSS 还需要一点时间拉取。
+# 等几秒后写一个请求文件，由 SwiftBar 插件去触发 NetNewsWire 刷新。
+# 这样定时任务不需要自己拿辅助功能权限，只要 SwiftBar 有权限即可。
+refresh_netnewswire() {
+  local delay="${NNW_REFRESH_DELAY:-5}"
+  local plugin_name="${NNW_PLUGIN_NAME:-netnewswire_unread.1m.py}"
+  local request_file="${HOME}/Library/Caches/swiftbar-netnewswire.request"
+
+  if ! pgrep -x NetNewsWire >/dev/null 2>&1; then
+    log "NetNewsWire 未运行，跳过刷新"
+    return 0
+  fi
+
+  log "等待 ${delay}s 让 FreshRSS 处理更新..."
+  sleep "$delay"
+
+  mkdir -p "$(dirname "$request_file")"
+  date +%s > "$request_file"
+  open "swiftbar://refreshplugin?name=${plugin_name}" >/dev/null 2>&1 || true
+  log "已请求 SwiftBar 刷新 NetNewsWire"
+}
+
 # 透传参数：run.sh zhihu-kvxjr369f 等
 "$PYTHON" "$SCRIPT_DIR/rss.py" "$@"
 ec=$?
 
 if [ "$ec" -ne 0 ]; then
   log "刷新失败（退出码 ${ec}）"
+else
+  refresh_netnewswire
 fi
 exit "$ec"
