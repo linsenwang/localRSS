@@ -70,6 +70,8 @@ _RE_LABEL = re.compile(
 _RE_IMG = re.compile(r"<img\b[^>]*>", re.I)
 _RE_SRC = re.compile(r'\bsrc="([^"]*)"', re.I)
 _RE_ALT = re.compile(r'\balt="([^"]*)"', re.I)
+#: 正文里只用来撑行距的空段落：<p><br></p>、<p><br/></p>、<p> <br> </p> …
+_RE_EMPTY_P = re.compile(r"<p\b[^>]*>(?:\s|<br\s*/?>)*</p>", re.I)
 
 
 def _squash(text: str) -> str:
@@ -242,7 +244,7 @@ def _sanitize_body(raw: str) -> str:
         lambda m: f'{m.group(1)}="{html.escape(_abs_url(m.group(2)), quote=True)}"',
         raw,
     )
-    return raw.strip()
+    return _RE_EMPTY_P.sub("", raw).strip()
 
 
 class _Http:
@@ -347,6 +349,15 @@ class LatepostProvider(Provider):
     def setup(self, bridge: Bridge) -> None:
         # 直连站点，不需要切标签页。
         return None
+
+    def postprocess(self, items: list[Item], bridge: Bridge) -> list[Item]:
+        # 站点正文用 <p><br></p> 撑段距，阅读器里会变成一串空行。除了抓取时
+        # 清洗，存量条目也在这里过一遍 —— 改规则后不用 force 重抓全文。
+        items = super().postprocess(items, bridge)
+        for item in items:
+            if item.content:
+                item.content = _RE_EMPTY_P.sub("", item.content).strip()
+        return items
 
     def _list_page(self, page: int) -> list[dict]:
         raw = self.http.post_form(
