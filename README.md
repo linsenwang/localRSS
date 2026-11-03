@@ -13,6 +13,7 @@
 | B 站消息 | `bilibili_notify` | 消息中心：收到的赞（`#/love`）、回复我的（`#/reply`）、@我的（`#/at`） |
 | 知乎 | `zhihu` | 个人主页动态（`https://www.zhihu.com/people/<token>`）或通知中心（`https://www.zhihu.com/notifications`） |
 | 晚点LatePost | `latepost` | 最新报道（`https://www.latepost.com/news`），直连站点，不需要浏览器 |
+| IT之家 | `ithome` | 博客版最新资讯（`https://www.ithome.com/blog/`），每 20 条合成一条合集，直连站点 |
 
 ## 前置条件
 
@@ -145,13 +146,14 @@ rm state/*.json && ./main.sh
 
 | 改的东西 | 生效方式 |
 |----------|----------|
-| `exclude_keywords` | **立即** |
+| `exclude_keywords` / `block_ad_hosts` / `block_keywords` | **立即** |
 | `filter_self_repost` / `filter_image_only` | **立即** |
 | `dedupe_by_content` / `dedupe_memory_days` | **立即** |
 | `output.dropped_log` | 下次运行（只是多写一份过滤清单，不影响 RSS 内容） |
 | `output.archive` / `archive_dir` / `archive_rotate_mb` | **立即**（改 `archive_dir` 会让后续归档写进新目录，旧目录里的不搬） |
 | `show_avatar` / `embed_player` | **立即** |
 | `image_digest_size` / `image_digest_max_age_hours` | 下次运行。**正文会跟着重渲染，但已经分好的批次不会重排** —— 要重来就删掉 state 里那些 `extra.kind == "image_digest"` 的条目 |
+| `digest_size` / `digest_max_age_hours`（ithome） | 下次运行。已经分好的合集不会重排 —— 要重来就删掉 state 里 `extra.kind == "ithome_digest"` 的条目 |
 | `max_pages` / `fulltext` / `max_fulltext_per_run` | 下次运行 |
 | `mode` / `entry_name` / `limit` / `token` | 下次运行（换 `entry_name` 相当于换一个源，建议连同 `id` 一起改，别让两个分类共用一份 state） |
 | 标题格式、正文结构这类**渲染逻辑**的改动 | 要 `./main.sh force` |
@@ -887,6 +889,44 @@ YION-Archive、iroha-捏圆圆hee中 赞了你的评论：这两集老好了咋b
 站点当前用 Let's Encrypt 新一代 YR2 中间证书，根证书 `ISRG Root YR` 可能还不在
 本机 CA 库里，标准校验会报 `unable to get local issuer certificate`。`auto` 只在
 这种情况下退回不校验（只读公开新闻，不涉及登录态）；装好根证书后建议改成 `true`。
+
+### ithome 的 options
+
+`type: ithome` 抓 IT之家博客版（`https://www.ithome.com/blog/`），**不需要浏览器**
+（`needs_browser = False`）。首屏是服务端渲染的 50 条；「加载更多」其实是一个：
+
+```
+POST https://www.ithome.com/category/blogpage?page=<页码>&ot=<毫秒时间戳>
+-> {"success": true, "content": {"html": "<li>…</li>…", "count": 50}}
+```
+
+`ot` 取自当前页**最后一条**的 `data-ot`（ISO 时间，转成毫秒），决定下一批从哪
+接着往更早翻；`page` 只是序号。返回 `count: 0` 就是到底了。抓取时按这个游标翻页，
+增量轮次里整页都是已有记录就停，和别的源一样。
+
+IT之家发稿量大，默认把攒够的 `digest_size` 条（20）合成一条「合集」：一条里按
+**从新到旧**列出这 20 条，每条都是**缩略图在左、标题/时间/摘要在右**（和网页
+列表一致），点标题或图片进原文。单条本身仍然留在 state / archive 里
+（`digest_size: 0` 可关掉合集，恢复每条单独进 RSS）。
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `max_pages` | `2` | 首轮最多翻几页（每页 50 条）；之后整页都见过就停 |
+| `digest_size` | `20` | 攒够这么多条合成一条合集；`0` = 关掉 |
+| `digest_max_age_hours` | `24` | 攒不满时的兜底有效期（小时）；`0` = 不兜底，一直攒满才发 |
+| `block_ad_hosts` | `["lapin.ithome.com"]` | 广告域名：链接落在这里的条目直接丢（`[]` = 不过滤） |
+| `block_keywords` | `["追觅", "云鲸"]` | 额外屏蔽词：标题/摘要/标签命中就丢（`[]` = 不过滤） |
+| `timeout` | `30` | 单次 HTTP 超时（秒） |
+
+`block_ad_hosts` / `block_keywords` 等价于博客版网页上那个油猴脚本：`lapin`
+域的「值得买」推广、以及带指定关键词的条目不进 RSS。规则在合成合集之前执行，
+所以被屏掉的条目不会混进 20 条合集里；丢掉了哪些、为什么丢，看
+`logs/ithome.dropped.log`。
+
+合集条目也存进 state，并把「合成过哪些文章」记在 `extra.digest_ids` 里，所以反复
+运行不会重复合成。攒不满 20 条时日志会打一行
+`[合集] 在攒 N/20 条（还差 M 条）`，说明它没坏，只是在等；想发得更勤就调小
+`digest_size` 或 `digest_max_age_hours`。
 
 ### wechat_mp 的 options
 

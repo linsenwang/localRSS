@@ -321,6 +321,44 @@ feeds:
       delay_s: 0.3
       tls_verify: auto
 
+  # ---- IT之家 博客版（直连站点，不需要浏览器）----
+  #
+  # 列表页 https://www.ithome.com/blog/ 首屏 50 条；「加载更多」实际是
+  # POST /category/blogpage?page=<页码>&ot=<当前页最后一条的毫秒时间戳>，
+  # 返回 JSON（content.html 里还是同样的 <li> 列表）。ot 是往更早翻的游标，
+  # 返回 count=0 就到头了。
+  #
+  # IT之家发稿量大，默认每攒够 20 条合成一条「合集」进 RSS：一条里按从新到旧
+  # 列出这 20 条，每条是缩略图在左、标题/时间/摘要在右（和网页列表一致），
+  # 避免一条条刷屏。单条本身仍留在 state / archive 里。
+  #   max_pages: 2               首轮最多翻几页（每页 50 条），之后整页都见过就停
+  #   digest_size: 20            攒够多少条合成一条；0 = 关掉合集，每条单独进 RSS
+  #   digest_max_age_hours: 24   攒不满的兜底有效期（小时）；0 = 一直攒满才发
+  #   block_ad_hosts            广告域名，链接落在这些域名的条目直接丢
+  #   block_keywords            额外屏蔽词（标题/摘要/标签里命中就丢）
+  #   timeout: 30
+  #
+  # 广告和关键词规则等价于博客版网页上的油猴脚本：lapin.ithome.com 的「值得买」
+  # 推广、以及标题/正文里带「追觅」「云鲸」的条目不再进合集。被丢掉的原因会写到
+  # logs/ithome.dropped.log。
+  - id: ithome
+    type: ithome
+    title: IT之家
+    description: IT之家
+    site_url: https://www.ithome.com/blog/
+    enabled: true
+    history: 200         # 每条约 0.5 KB 摘要，200 条约 100 KB；够装几轮合集
+    options:
+      max_pages: 2
+      digest_size: 20
+      digest_max_age_hours: 24
+      block_ad_hosts:
+        - lapin.ithome.com
+      block_keywords:
+        - 追觅
+        - 云鲸
+      timeout: 30
+
   # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
   # - id: bilibili-up
   #   type: bilibili
