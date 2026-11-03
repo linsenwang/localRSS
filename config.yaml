@@ -326,7 +326,8 @@ feeds:
   # 列表页 https://www.ithome.com/blog/ 首屏 50 条；「加载更多」实际是
   # POST /category/blogpage?page=<页码>&ot=<当前页最后一条的毫秒时间戳>，
   # 返回 JSON（content.html 里还是同样的 <li> 列表）。ot 是往更早翻的游标，
-  # 返回 count=0 就到头了。
+  # page 是从 1 开始的偏移量（站点自己的 JS 就是 var page=1 然后 page++）；
+  # 跳号会整页漏抓。返回 count=0 就到头了。
   #
   # IT之家发稿量大，默认每攒够 20 条合成一条「合集」进 RSS：一条里按从新到旧
   # 列出这 20 条，每条是缩略图在左、标题/时间/摘要在右（和网页列表一致），

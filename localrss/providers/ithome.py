@@ -370,8 +370,15 @@ class IthomeProvider(Provider):
         new_on_page = collect(page_items)
 
         # 整页都是已有记录就停：增量轮次通常第一页就结束。
+        #
+        # page 必须从 1 开始，不能从 2（这里之前写错过，导致每轮固定漏掉
+        # 紧挨着的一整页 50 条）：站点的「加载更多」是 page=1、2、3… 的
+        # 偏移量，和 ot 游标一起用。page=2 配第一页的 ot 会直接跳到第二个
+        # 50 条区块，把第一个区块整段跳过；随着首页窗口滑动，被跳过的内容
+        # 会换一批，看起来就像早上的文章「晚几个小时才放出来」。
+        # `max_pages` 是总页数（含首屏），所以这里只跑到 max_pages - 1。
         if not known_ids or new_on_page:
-            for page_no in range(2, self.max_pages + 1):
+            for page_no in range(1, self.max_pages):
                 if not ot:
                     break
                 items, next_ot = self._more_page(page_no, ot)
