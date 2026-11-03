@@ -161,6 +161,8 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge | None, force: bool = False)
         {
             # 全局关键词 + 该源自己的关键词（feed 级的只影响这个源）
             "exclude_keywords": cfg.exclude_keywords + feed_cfg.exclude_keywords,
+            # 跨源去重要读另一个 feed 的 XML（见 ithome 的 dedupe_feed）
+            "output_dir": str(cfg.output_dir),
         },
     )
 

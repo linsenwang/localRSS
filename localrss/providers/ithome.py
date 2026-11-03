@@ -21,7 +21,10 @@ import re
 import sys
 import urllib.parse
 import urllib.request
-from datetime import datetime
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 
 from ..bridge import Bridge
 from ..models import Item, sort_key
@@ -184,6 +187,57 @@ def _age_hours(dt: datetime | None) -> float:
     return (now - dt).total_seconds() / 3600
 
 
+# ---------- 跨源去重：拿另一个 feed 的商品名在标题里找 ----------
+
+#: 小米商城 feed 里商品名的前缀（「众筹 · 米家洗鞋机」），比对前去掉
+_RE_PRODUCT_PREFIX = re.compile(r"^\s*众筹(?:预约)?\s*[·:：]?\s*")
+#: 商品名尾部的「系列」不影响它是不是同一件商品
+_RE_PRODUCT_SERIES = re.compile(r"系列\s*$")
+#: 商品名里的括注（「含NFC版、陶瓷版等」）不参与比对
+_RE_MATCH_PAREN = re.compile(r"（[^）]*）|\([^)]*\)")
+#: 空格、标点、全角符号都抹掉，剩下的才是能比的部分
+_RE_MATCH_DROP = re.compile(
+    r"[\s·．.,，。:：;；、!！?？'\"“”‘’()（）\[\]【】<>《》\-—_/\\|+&%#@~`^*=]+"
+)
+
+
+def _norm_match(text: str) -> str:
+    text = _RE_MATCH_PAREN.sub("", (text or "").lower())
+    return _RE_MATCH_DROP.sub("", text)
+
+
+def _product_display(title: str) -> str:
+    return _RE_PRODUCT_PREFIX.sub("", title or "").strip()
+
+
+def _product_keys(title: str) -> set[str]:
+    """商品名 -> 几个用来在文章标题里找它的写法（太短的不要，容易误伤）。"""
+    name = _RE_PRODUCT_SERIES.sub("", _RE_PRODUCT_PREFIX.sub("", title or ""))
+    keys = {_norm_match(name), _norm_match(name.replace("智能", ""))}
+    return {k for k in keys if len(k) >= 5}
+
+
+def _ascii_alnum(ch: str) -> bool:
+    return ch.isascii() and ch.isalnum()
+
+
+def _mentions(text: str, key: str) -> bool:
+    """key 出现在 text 里，且不是更长型号的前半截（「K100」不命中「K100 Pro」）。
+
+    中文不算「更长型号」的一部分 ——「米家洗鞋机」后面跟着「3KG」还是它自己，
+    但「小米智能开关2」后面的「Pro」说明那是另一个商品。
+    """
+    start = 0
+    while True:
+        i = text.find(key, start)
+        if i < 0:
+            return False
+        j = i + len(key)
+        if not (_ascii_alnum(key[-1]) and j < len(text) and _ascii_alnum(text[j])):
+            return True
+        start = i + 1
+
+
 class _Http:
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
@@ -248,7 +302,71 @@ class IthomeProvider(Provider):
         self.block_keywords = _list_opt(
             "block_keywords", DEFAULT_BLOCK_KEYWORDS
         )
+        self.block_patterns: list[tuple[re.Pattern, str]] = []
+        for pattern in _list_opt("block_patterns", ()):
+            try:
+                self.block_patterns.append((re.compile(pattern, re.I), pattern))
+            except re.error as e:
+                print(
+                    f"    [ithome] block_patterns 里的正则无效，已忽略：{pattern}（{e}）",
+                    file=sys.stderr,
+                )
+        self.dedupe_feed = str(self.opt("dedupe_feed", "") or "").strip()
+        try:
+            self.dedupe_days = max(0.0, float(self.opt("dedupe_days", 30)))
+        except (TypeError, ValueError):
+            self.dedupe_days = 30.0
+        self._dedupe_products: list[tuple[str, str]] | None = None
         self.http = _Http(timeout=int(self.opt("timeout", 30)))
+
+    def _load_dedupe_products(self) -> list[tuple[str, str]]:
+        """读出 dedupe_feed 最近 dedupe_days 天的商品名，按长度从长到短排好。"""
+        if self._dedupe_products is not None:
+            return self._dedupe_products
+        self._dedupe_products = []
+        if not self.dedupe_feed or self.dedupe_days <= 0:
+            return self._dedupe_products
+
+        path = Path(self.dedupe_feed).expanduser()
+        if not path.suffix:
+            out_dir = self.common.get("output_dir")
+            if out_dir:
+                path = Path(out_dir) / f"{self.dedupe_feed}.xml"
+        try:
+            root = ET.parse(path).getroot()
+        except (OSError, ET.ParseError) as e:
+            print(
+                f"    [去重] 读不到 {path}（{e}），本轮跳过跨源去重",
+                file=sys.stderr,
+            )
+            return self._dedupe_products
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.dedupe_days)
+        names: set[str] = set()
+        for node in root.iter("item"):
+            title = (node.findtext("title") or "").strip()
+            if not title:
+                continue
+            try:
+                when = parsedate_to_datetime(node.findtext("pubDate") or "")
+            except (TypeError, ValueError):
+                when = None
+            if when and when.tzinfo and when < cutoff:
+                continue
+            display = _product_display(title)
+            names.add(display)
+            for key in _product_keys(title):
+                self._dedupe_products.append((key, display))
+
+        # 长名字先比：「REDMI K100 Pro」应该优先于「REDMI K100」命中
+        # （后者会被型号边界挡掉，这里排一下只是让原因日志指向更准的那个）。
+        self._dedupe_products.sort(key=lambda pair: -len(pair[0]))
+        if names:
+            print(
+                f"    [去重] {path.name} 最近 {self.dedupe_days:g} 天有 {len(names)} 个商品",
+                file=sys.stderr,
+            )
+        return self._dedupe_products
 
     # ---------- 抓取 ----------
 
@@ -396,10 +514,10 @@ class IthomeProvider(Provider):
         )
         return out
 
-    # ---------- 后处理：广告/关键词过滤 + 20 条合成一条 ----------
+    # ---------- 后处理：广告/关键词/正则/跨源去重 + 20 条合成一条 ----------
 
     def _blocked_reason(self, item: Item) -> str:
-        """对应网页端那个油猴脚本：广告域名 + 指定关键词。"""
+        """对应网页端那个油猴脚本：广告域名 + 指定关键词/正则 + 跨源去重。"""
         host = (urllib.parse.urlparse(_abs_url(item.link)).hostname or "").lower()
         for ad in self.ad_hosts:
             if host == ad or host.endswith("." + ad):
@@ -408,6 +526,17 @@ class IthomeProvider(Provider):
         for keyword in self.block_keywords:
             if keyword.lower() in text:
                 return f"关键词「{keyword}」"
+        # 以下两条只看标题（+标签）：正文里顺带提到别的产品的报道不该被误杀。
+        heading = " ".join([item.title or "", " ".join(item.extra.get("tags") or [])])
+        products = self._load_dedupe_products()
+        if products:
+            norm = _norm_match(heading)
+            for key, name in products:
+                if _mentions(norm, key):
+                    return f"与 {self.dedupe_feed} 重复：{name}"
+        for regex, pattern in self.block_patterns:
+            if regex.search(heading):
+                return f"标题匹配 /{pattern}/"
         return ""
 
     def _apply_digest(

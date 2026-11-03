@@ -14,6 +14,7 @@
 | 知乎 | `zhihu` | 个人主页动态（`https://www.zhihu.com/people/<token>`）或通知中心（`https://www.zhihu.com/notifications`） |
 | 晚点LatePost | `latepost` | 最新报道（`https://www.latepost.com/news`），直连站点，不需要浏览器 |
 | IT之家 | `ithome` | 博客版最新资讯（`https://www.ithome.com/blog/`），每 20 条合成一条合集，直连站点 |
+| 小米商城 | `xiaomi_shop` | 上新日历 + 小米众筹（开售/预约），直连接口，不需要浏览器 |
 
 ## 前置条件
 
@@ -146,7 +147,7 @@ rm state/*.json && ./main.sh
 
 | 改的东西 | 生效方式 |
 |----------|----------|
-| `exclude_keywords` / `block_ad_hosts` / `block_keywords` | **立即** |
+| `exclude_keywords` / `block_ad_hosts` / `block_keywords` / `block_patterns` / `dedupe_feed` / `dedupe_days` | **立即** |
 | `filter_self_repost` / `filter_image_only` | **立即** |
 | `dedupe_by_content` / `dedupe_memory_days` | **立即** |
 | `output.dropped_log` | 下次运行（只是多写一份过滤清单，不影响 RSS 内容） |
@@ -918,6 +919,9 @@ IT之家发稿量大，默认把攒够的 `digest_size` 条（20）合成一条�
 | `digest_max_age_hours` | `24` | 攒不满时的兜底有效期（小时）；`0` = 不兜底，一直攒满才发 |
 | `block_ad_hosts` | `["lapin.ithome.com"]` | 广告域名：链接落在这里的条目直接丢（`[]` = 不过滤） |
 | `block_keywords` | `["追觅", "云鲸"]` | 额外屏蔽词：标题/摘要/标签命中就丢（`[]` = 不过滤） |
+| `block_patterns` | `[]` | 额外屏蔽正则（大小写不敏感，**只匹配标题 + 标签**，不匹配正文）；`[]` = 不过滤 |
+| `dedupe_feed` | `""` | 和另一个 feed 去重：标题里提到它最近上架的商品就丢；填 feed id 或 XML 路径，`""` = 关掉 |
+| `dedupe_days` | `30` | `dedupe_feed` 只看最近多少天的商品；`0` = 关掉去重 |
 | `timeout` | `30` | 单次 HTTP 超时（秒） |
 
 `block_ad_hosts` / `block_keywords` 等价于博客版网页上那个油猴脚本：`lapin`
@@ -925,10 +929,106 @@ IT之家发稿量大，默认把攒够的 `digest_size` 条（20）合成一条�
 所以被屏掉的条目不会混进 20 条合集里；丢掉了哪些、为什么丢，看
 `logs/ithome.dropped.log`。
 
+`block_patterns` 用来拦**关键词表达不了的组合**（比如「品牌 + 动作」要同时出现），
+大小写不敏感，只匹配标题 + 标签，顺序不限：
+
+```yaml
+      block_patterns:
+        - '(?=.*(?:小米|米家|红米))(?=.*(?:众筹|上架|上新|开售))'
+```
+
+当前配置里**没有**用它，小米那类刷屏改由下面的跨源去重处理 —— 品牌级规则太粗，
+会把正文里顺带提小米的评测也拦掉。
+
+### ithome · 跨源去重（`dedupe_feed`）
+
+小米商城已经单列了一个 feed（`xiaomi-new`），IT之家再把同一件商品的上架 /
+众筹发一遍就是纯重复。所以 `ithome` 会读那个 feed 的 XML，把最近
+`dedupe_days`（默认 **30**）天上架过的商品名拿去比对标题，命中就不进 RSS：
+
+```yaml
+      dedupe_feed: xiaomi-new
+      dedupe_days: 30
+```
+
+- **只比标题**（+ 标签），正文里顺带提到这些商品的文章不算重复；
+- 商品名先去掉空格、标点、`众筹 ·` / `众筹预约 ·` 前缀和括注再比，
+  所以「米家洗鞋机」能命中「小米"米家洗鞋机 3KG"上架」；
+- 型号边界也管着：`REDMI K100` 不会命中 `REDMI K100 Pro`（那是另一件商品），
+  中文后面接型号不算边界（「米家洗鞋机」后面跟 `3KG` 仍然是它自己）；
+- 只看最近 30 天：半年前的老商品不该把正常报道误伤掉；想更紧就调小，
+  调大只是拦得更多；
+- 用的是**上一轮**的 `output/xiaomi-new.xml`（ithome 在配置里排在它前面），
+  所以刚上架的商品最多晚一个周期才被去重，这不影响正确性。
+
+被丢的条目在 `logs/ithome.dropped.log` 里的原因是
+`与 xiaomi-new 重复：米家洗鞋机`。找不到那个 XML 时只打一行 stderr，
+跳过跨源去重，抓取照常进行。
+
 合集条目也存进 state，并把「合成过哪些文章」记在 `extra.digest_ids` 里，所以反复
 运行不会重复合成。攒不满 20 条时日志会打一行
 `[合集] 在攒 N/20 条（还差 M 条）`，说明它没坏，只是在等；想发得更勤就调小
 `digest_size` 或 `digest_max_age_hours`。
+
+### xiaomi_shop 的 options
+
+`type: xiaomi_shop` 抓小米商城的「上新日历」和「小米众筹」，
+**不需要浏览器**（`needs_browser = False`）。
+
+上新日历走 App 自己的接口：
+
+```
+POST http://api.m.mi.com/v1/home/product_channel_get_list
+"timestamp_mishop_client=<毫秒>&page_index=<n>&page_size=<n>&nonce_mishop_client=<uuid>&"
+```
+
+无 sign、无登录态，只要一组固定的客户端头（`Mishop-Client-Id` / `Uuid` /
+`User-Agent: okhttp/3.12.3` 等，见 `xiaomi_shop.py` 的 `HEADERS`）。返回里：
+
+- `history_date_list` 是按日期分好组的上新日历：`[{date: "20261102", product_list: [...]}]`；
+- `new_list` 是最新 20 个新品，和日期桶有重叠 —— 按 `product_id` 去重；
+- `page_size` 是**日期桶的个数**，不是商品数：一页 20 个日期、约 60~80 个商品。
+
+众筹（`crowdfunding: true`，默认开）也走同一个 mtop venue 接口：
+
+```
+GET  https://shop-api.retail.mi.com/mtop/navi/venue/page?page_id=16044
+POST https://shop-api.retail.mi.com/mtop/navi/venue/batch?page_id=16044
+```
+
+同样不需要 sign 计算或登录态。页面配置里 `mishop_crowd_list` 是**众筹好物（开售）**，
+`mishop_crowd_reserve` 是**众筹新品（预约）**；列表参数（`resolver` / `sign` /
+`parameter`）从配置的 `floors` 里现读，不写死。众筹抓取失败只打一行 stderr，
+不影响上新日历那一部分。
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `max_pages` | `3` | 上新日历最多翻几页（每页 20 个日期桶）；之后整页都是已有商品就停 |
+| `page_size` | `20` | 每页多少个日期桶 |
+| `crowdfunding` | `true` | 同一个 feed 里也抓小米众筹（开售 + 预约）；`false` 关掉 |
+| `timeout` | `15` | 单次 HTTP 超时（秒） |
+
+三类条目的 id 和链接都是稳定的，价格/进度变化会刷新正文但不会重复提醒：
+
+| 条目 | id | 链接 |
+|------|----|------|
+| 上新日历 | `mi:<product_id>` | `https://www.mi.com/item/<product_id>` |
+| 众筹好物 | `mi:crowd:<project_id>` | `https://m.mi.com/crowdfunding/proddetail/<project_id>` |
+| 众筹预约 | `mi:crowd-reserve:<actId>` | `https://m.mi.com/crowdfunding` |
+
+上新日历的正文顺序是：主图 → 价格（多 SKU 带「起」，原价不同时附上）→
+「新品看点」→ 标签/上架日期 → 商品链接；众筹好物带众筹价、已筹金额/支持人数/进度
+和众筹时间；众筹预约带预约人数、卖点、预约时间和状态（未开始/预约中/已结束）。
+
+```yaml
+  - id: xiaomi-new
+    type: xiaomi_shop
+    title: 小米商城 · 上新日历
+    site_url: https://www.mi.com/
+    options:
+      max_pages: 3
+      crowdfunding: true
+```
 
 ### wechat_mp 的 options
 
@@ -1901,6 +2001,7 @@ local_rss/
 │       ├── base.py          # Provider 基类
 │       ├── bilibili.py
 │       ├── latepost.py      # 晚点LatePost（直连站点，不用浏览器）
+│       ├── xiaomi_shop.py   # 小米商城上新日历（直连接口，不用浏览器）
 │       ├── wechat_mp.py     # 公众号推送（读本地微信数据库，不用浏览器）
 │       └── zhihu.py
 ├── output/                  # 生成的 RSS

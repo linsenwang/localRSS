@@ -337,6 +337,9 @@ feeds:
   #   digest_max_age_hours: 24   攒不满的兜底有效期（小时）；0 = 一直攒满才发
   #   block_ad_hosts            广告域名，链接落在这些域名的条目直接丢
   #   block_keywords            额外屏蔽词（标题/摘要/标签里命中就丢）
+  #   block_patterns            额外屏蔽正则（只匹配标题/标签）
+  #   dedupe_feed               和另一个 feed 去重：标题里提到它最近上架的商品就丢
+  #   dedupe_days: 30           dedupe_feed 只看最近多少天的商品；0 = 关掉去重
   #   timeout: 30
   #
   # 广告和关键词规则等价于博客版网页上的油猴脚本：lapin.ithome.com 的「值得买」
@@ -358,7 +361,39 @@ feeds:
       block_keywords:
         - 追觅
         - 云鲸
+      # 小米商城已经单列一个 feed（xiaomi-new），IT之家再发一遍就是重复：
+      # 标题里出现它最近 30 天上架的商品名，这条就不进 RSS。
+      # 只比标题，不看正文；商品名去掉空格/标点后比对，型号边界也管着
+      # （「K100」不会命中「K100 Pro」）。
+      dedupe_feed: xiaomi-new
+      dedupe_days: 30
       timeout: 30
+
+  # ---- 小米商城「上新日历」+ 小米众筹（直连接口，不需要浏览器）----
+  #
+  # 上新日历: POST http://api.m.mi.com/v1/home/product_channel_get_list
+  # 无 sign、无登录态，固定客户端头 + 时间戳/随机数即可。返回的
+  # history_date_list 是按日期分组的上新日历；new_list 是最新 20 个新品
+  # （和日期桶有重叠，按 product_id 去重）。
+  # 众筹走 mtop venue 接口（page_id=16044），列表参数从页面配置里现读。
+  #   max_pages: 3      最多翻几页。page_size 是「日期桶」的个数（不是商品数），
+  #                     每页约 20 个日期 / 60~80 个商品
+  #   page_size: 20     每页多少个日期桶
+  #   crowdfunding: true  同一个 feed 里再抓小米众筹：众筹好物（开售）+ 众筹新品（预约）
+  #   timeout: 15       单次 HTTP 超时（秒）
+  - id: xiaomi-new
+    type: xiaomi_shop
+    title: 小米商城
+    description: 小米商城上新日历
+    site_url: https://www.mi.com/
+    enabled: true
+    history: 200         # 每条约 1 KB（图片外链）。要 ≥ max_pages 能翻到的商品数（约 150），
+                         # 否则滚出窗口的老商品会被下一页重新当成「新品」抓回来
+    options:
+      max_pages: 3
+      page_size: 20
+      crowdfunding: true   # 小米众筹（开售 + 预约）也进这个 feed
+      timeout: 15
 
   # ---- 想抓某个 UP 主的动态，复制下面这段并取消注释 ----
   # - id: bilibili-up
