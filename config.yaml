@@ -228,6 +228,28 @@ feeds:
       mode: notifications
       entry_name: all
 
+  # ---- B 站消息中心（谁赞了/回复了/@了你）----
+  #
+  # 对应 https://message.bilibili.com/#/love（收到的赞）和 #/reply（回复我的）、
+  # #/at（@我的）。和上面的关注动态不同，这条抓的是**你自己收到的消息**。
+  #   entry_name: all       通知分类：
+  #                           all    三种合并（默认）
+  #                           love   收到的赞
+  #                           reply  回复我的
+  #                           at     @我的
+  #   max_pages: 5          每个分类最多翻几页（每页 20 条）
+  #   list_retries: 2       接口偶发失败时的短重试次数
+  #   list_retry_delay_s: 15  每次重试之间的间隔秒数
+  - id: bilibili-notifications
+    type: bilibili_notify
+    title: B站通知
+    description: message.bilibili.com 消息中心（收到的赞 / 回复 / @）
+    site_url: https://message.bilibili.com/#/love
+    enabled: true
+    history: 150         # 每条一句动作 + 一段回复正文，很轻
+    options:
+      entry_name: all
+
   # ---- 微信公众号推送 ----
   #
   # 从本地解密的微信数据库读公众号图文消息，再用文章链接抓原文正文。

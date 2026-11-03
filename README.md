@@ -10,6 +10,7 @@
 | 站点 | `type` | 说明 |
 |------|--------|------|
 | B 站 | `bilibili` | 关注动态（`https://t.bilibili.com/`）或指定 UP 主空间动态 |
+| B 站消息 | `bilibili_notify` | 消息中心：收到的赞（`#/love`）、回复我的（`#/reply`）、@我的（`#/at`） |
 | 知乎 | `zhihu` | 个人主页动态（`https://www.zhihu.com/people/<token>`）或通知中心（`https://www.zhihu.com/notifications`） |
 | 晚点LatePost | `latepost` | 最新报道（`https://www.latepost.com/news`），直连站点，不需要浏览器 |
 
@@ -815,6 +816,54 @@ q9adg 回复了回答下你的评论：如何看待“谁善待员工就买谁�
   **合并**（多人点赞同一条评论合成一条，`merge_count` 从 1 变 2、3…），合并后 actors
   会变多但 id 不变 —— 好处是阅读器不会因为多了一个赞就重复提醒，代价是已经收下的
   那条不会跟着刷新（见「阅读器那一侧的缓存」）。
+
+### bilibili_notify（B 站消息中心）
+
+`type: bilibili_notify` 抓**你自己收到的**消息，对应：
+
+| 页面 | `entry_name` | 接口 |
+|------|--------------|------|
+| https://message.bilibili.com/#/love | `love`（收到的赞） | `api.bilibili.com/x/msgfeed/like` |
+| https://message.bilibili.com/#/reply | `reply`（回复我的） | `api.bilibili.com/x/msgfeed/reply` |
+| https://message.bilibili.com/#/at | `at`（@我的） | `api.bilibili.com/x/msgfeed/at` |
+
+```yaml
+  - id: bilibili-notifications
+    type: bilibili_notify
+    title: B站通知
+    site_url: https://message.bilibili.com/#/love
+    options:
+      entry_name: all      # all = 上面三种合并；也可以只写 love / reply / at
+```
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `entry_name` | `all` | `all`：三种合并；`love`：收到的赞；`reply`：回复我的；`at`：@我的 |
+| `max_pages` | `5` | **每个分类**最多翻几页，每页 20 条 |
+| `list_retries` | `2` | 接口偶发失败时的短重试次数 |
+| `list_retry_delay_s` | `15` | 每次重试之间的等待秒数 |
+
+和知乎通知一样，条目 id 用平台自己的消息 id（`bilibili-notif:<分类>:<id>`），
+标题格式是 `谁 + 干了什么 + ： + 相关内容`：
+
+```
+YION-Archive、iroha-捏圆圆hee中 赞了你的评论：这两集老好了咋b站才这点播放
+自动鸦Autoya 回复了你：回顾企划这种事得阿黑拍板 @黑鸦Heya——自动鸦
+```
+
+正文是 `动作 / 对方说的话 / 你的原评论 / 链接`。收到的赞没有「对方说的话」，
+正文里就是动作 + 被赞的那条内容。
+
+几个实现上的细节：
+
+- 页面的 hash 是 `#/love`，接口却叫 **`like`**（`x/msgfeed/love` 是 404）。
+  代码里用 `API_ENTRY` 做了映射。
+- 翻页参数不是页码，而是上一页最后一条的游标：`id` + `like_time` / `reply_time` /
+  `at_time`（页面自己的 JS 就是这么传的）。
+- 收到的赞接口回的是 `{latest, total}`：`latest` 是「上次看过之后的新赞」，
+  `total` 是全部，两边合起来按 id 去重。
+- 点赞通知会被平台合并（多人赞同一条评论合成一条，`users` 里好几个名字），
+  名字全列在标题里；`counts` 比名字多时补一个「等 N 人」。
 
 ### latepost 的 options
 
