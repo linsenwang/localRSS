@@ -334,14 +334,28 @@ def _apply_player(item: Item, style: str) -> None:
     content = _PLAYER_RE.sub("", item.content or "")
     if style:
         for bvid in _bvids_of(item):
-            # 正文里那行说明：普通投稿是「投稿视频：」，合集更新是「合集更新：」
+            # 正文里那行说明：普通投稿是「投稿视频：」，合集更新是「合集更新：」。
+            # 播放器放在这条视频卡片的**封面后面**（和网页一样：标题/简介/封面，
+            # 再接播放器）；没有封面就放在简介后面，连简介也没有才紧跟标题。
             pat = re.compile(
                 r'(<p>(?:投稿视频|合集更新)：<a href="https://www\.bilibili\.com/video/'
-                + re.escape(bvid) + r'">.*?</a></p>)', re.S
+                + re.escape(bvid) + r'">.*?</a></p>)'
+                r'(<p>(?!<img\b).*?</p>)?'
+                r'(<p><img\b[^>]*></p>)?',
+                re.S,
             )
-            if pat.search(content):
-                content = pat.sub(lambda m: m.group(1) + _player_iframe(bvid, style),
-                                  content, count=1)
+            m = pat.search(content)
+            if not m:
+                continue
+            link_p = m.group(1)
+            desc_p = m.group(2) or ""
+            cover_p = m.group(3) or ""
+            insert_at = m.start() + len(link_p) + len(desc_p) + len(cover_p)
+            content = (
+                content[:insert_at]
+                + _player_iframe(bvid, style)
+                + content[insert_at:]
+            )
     item.content = content
 
 
