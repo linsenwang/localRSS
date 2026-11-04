@@ -58,6 +58,8 @@ class Config:
     dropped_log: bool
     #: 抓完有新内容时发一条 macOS 通知（osascript）
     notify: bool
+    #: 同时抓几个源；1 = 串行。并发按站点分组，见 cli._group_key
+    concurrency: int
     feeds: list[FeedConfig]
 
     @property
@@ -150,6 +152,8 @@ def load_config(path: str | Path) -> Config:
         dropped_log=bool(output_cfg.get("dropped_log", False)),
         # 没写这个键 = 开（抓完有新内容就提醒），写 false 才关
         notify=bool(output_cfg.get("notify", True)),
+        # 顶层 concurrency：同时抓几个源。默认 1 = 保持原来的串行行为。
+        concurrency=max(1, int(raw.get("concurrency", 1) or 1)),
         exclude_keywords=[
             str(k) for k in (raw.get("exclude_keywords") or []) if str(k).strip()
         ],

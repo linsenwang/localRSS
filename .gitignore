@@ -1,6 +1,8 @@
 # 生成物
 output/*.xml
+output/*.tmp
 state/*.json
+state/*.tmp
 logs/*.log
 archive/
 

@@ -11,7 +11,7 @@ import re
 import sys
 import time
 
-from ..bridge import Bridge
+from ..bridge import Bridge, StopRequested
 from ..models import Item
 
 
@@ -24,6 +24,10 @@ def retry_call(fn, attempts: int = 3, delay_s: float = 15.0, label: str = ""):
     for i in range(1, attempts + 1):
         try:
             return fn()
+        except StopRequested:
+            # 收工信号不是「这次调用失败」，别拿它当风控重试 —— 否则光 sleep
+            # 就能把退出拖长几十秒（并发时每个撞上信号的源都这样）。
+            raise
         except Exception as e:
             if i >= attempts:
                 raise

@@ -5,12 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import sys
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import feed as feed_mod
 from . import notify
@@ -74,6 +77,44 @@ def _feed_url(cfg: Config, feed_cfg) -> str:
     if cfg.base_url:
         return f"{cfg.base_url}/{feed_cfg.filename}"
     return feed_cfg.filename
+
+
+def _needs_browser(feed_cfg, types: dict) -> bool:
+    """这个源要不要浏览器；未知类型按默认（要）处理。"""
+    return getattr(types.get(feed_cfg.type), "needs_browser", True)
+
+
+def _group_key(feed_cfg, types: dict) -> str:
+    """并发调度的分组键。
+
+    依赖浏览器的源按**站点**分组：同一个站点上的多个源共用一个标签页、组内
+    串行（知乎的四个动态源就是一页，见 providers/zhihu.py 的 setup）。不同站点
+    之间才并发 —— evaluate/navigate 作用于 session 的当前标签页，同站两个源
+    同时跑会互相把页面切走。读本地/直连的源各自一组，互不影响。
+    """
+    if _needs_browser(feed_cfg, types):
+        host = urlsplit(feed_cfg.site_url or "").netloc.lower()
+        return host or feed_cfg.id
+    return f"feed:{feed_cfg.id}"
+
+
+def _group_session(base: str, key: str, concurrency: int) -> str:
+    """某个站点组用哪个 WebBridge session。
+
+    concurrency=1 时沿用原来的 session 名，行为和以前完全一样；并发时按站点
+    分开，免得两个站点的 navigate 抢同一个「当前标签页」。
+    """
+    if concurrency <= 1:
+        return base
+    return f"{base}-{re.sub(r'[^A-Za-z0-9._-]+', '-', key)}"
+
+
+def _feed_groups(feeds, types: dict) -> dict[str, list]:
+    """按 _group_key 分组，保持配置里的先后顺序。"""
+    groups: dict[str, list] = {}
+    for feed_cfg in feeds:
+        groups.setdefault(_group_key(feed_cfg, types), []).append(feed_cfg)
+    return groups
 
 
 def _short(path: object) -> str:
@@ -272,17 +313,19 @@ def _run_feed(feed_cfg, cfg: Config, bridge: Bridge | None, force: bool = False)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # feed 的订阅地址：既是 RSS 里的 <atom:link rel="self">，也是 WebSub 通知 hub 的 topic
     feed_url = _feed_url(cfg, feed_cfg)
-    output_path.write_text(
-        feed_mod.build_rss(
-            title=feed_cfg.title,
-            link=feed_cfg.site_url or provider.page_url(),
-            description=feed_cfg.description,
-            items=visible,
-            self_url=feed_url,
-            hub_url=feed_cfg.hub_url or cfg.hub_url,
-        ),
-        encoding="utf-8",
+    rss = feed_mod.build_rss(
+        title=feed_cfg.title,
+        link=feed_cfg.site_url or provider.page_url(),
+        description=feed_cfg.description,
+        items=visible,
+        self_url=feed_url,
+        hub_url=feed_cfg.hub_url or cfg.hub_url,
     )
+    # 原子替换：并发跑的时候，别的源（比如 ithome 的跨源去重）可能正在读这个文件，
+    # 不能让它读到写了一半的 XML。
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    tmp_path.write_text(rss, encoding="utf-8")
+    tmp_path.replace(output_path)
     return {
         "path": str(output_path),
         "total": len(visible),
@@ -456,19 +499,37 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.clean:
-        bridge = Bridge(
-            url=cfg.bridge_url, session=cfg.session, browser=cfg.browser,
-            stop=stop.is_set,
-        )
-        try:
-            check_bridge(bridge)
-        except BridgeError as e:
-            print(str(e), file=sys.stderr)
-            return 3
-        except StopRequested:
-            print("[停止] 清理刚开始就被中断信号打断，本次什么也没关。", file=sys.stderr)
-            return 130
-        closed, left = bridge.close_session()
+        # 并发时按站点分了 session（见 _group_session），残留的标签页也分散在
+        # 这些 session 里；逐个清，别只清主 session 就以为干净了。
+        types = providers.available_types()
+        sessions = [cfg.session]
+        if cfg.concurrency > 1:
+            groups = _feed_groups([f for f in cfg.feeds if f.enabled], types)
+            sessions += [
+                _group_session(cfg.session, key, cfg.concurrency)
+                for key, group in groups.items()
+                if _needs_browser(group[0], types)
+            ]
+        closed = 0
+        left: list[dict] = []
+        for i, session in enumerate(sessions):
+            bridge = Bridge(
+                url=cfg.bridge_url, session=session, browser=cfg.browser,
+                stop=stop.is_set,
+            )
+            if i == 0:
+                try:
+                    check_bridge(bridge)
+                except BridgeError as e:
+                    print(str(e), file=sys.stderr)
+                    return 3
+                except StopRequested:
+                    print("[停止] 清理刚开始就被中断信号打断，本次什么也没关。",
+                          file=sys.stderr)
+                    return 130
+            c, remaining = bridge.close_session()
+            closed += c
+            left.extend(remaining)
         print(f"[清理] 关闭了 {closed} 个标签页")
         # 关不掉的（没记进 session 的孤儿标签页）得让用户知道，别以为清干净了
         for tab in left:
@@ -507,35 +568,88 @@ def main(argv: list[str] | None = None) -> int:
     # 只有依赖浏览器的源才建 Bridge。读本地文件的源（type 的 needs_browser=False）
     # 不该因为 WebBridge 没开就整个跑不了 —— 比如只想刷新公众号推送的时候。
     types = providers.available_types()
-    need_browser = any(getattr(types.get(f.type), "needs_browser", True) for f in feeds)
+    groups = _feed_groups(feeds, types)
+    concurrency = max(1, min(cfg.concurrency, len(groups)))
 
-    bridge = None
-    if need_browser:
-        bridge = Bridge(
+    # 同一个站点的源共用一个 Bridge/session、组内串行（见 _group_key）：
+    # 知乎的四个源仍然只用一页，只是不同站点之间才会同时跑。
+    bridges: dict[str, Bridge] = {}
+    if any(_needs_browser(f, types) for f in feeds):
+        probe = Bridge(
             url=cfg.bridge_url, session=cfg.session, browser=cfg.browser,
             stop=stop.is_set,
         )
         try:
-            check_bridge(bridge)
+            check_bridge(probe)
         except BridgeError as e:
             print(str(e), file=sys.stderr)
             return 3
         except StopRequested:
             print("[停止] 启动阶段收到停止信号，本次不抓取。", file=sys.stderr)
             return 130
+        for key, group in groups.items():
+            if not _needs_browser(group[0], types):
+                continue
+            bridges[key] = Bridge(
+                url=cfg.bridge_url,
+                session=_group_session(cfg.session, key, concurrency),
+                browser=cfg.browser, stop=stop.is_set,
+            )
 
     close_tabs = cfg.close_session and not args.keep_tabs
     failed = 0
     interrupted = False
     #: 本轮有新内容的源，抓完汇总成一条 macOS 通知（见文件末尾）
     news: list[str] = []
-    try:
-        for feed_cfg in feeds:
+
+    def run_group(key: str, group: list) -> list[tuple]:
+        """按组串行抓；返回 [(feed, result, error)]，不抛给线程池。"""
+        out: list[tuple] = []
+        for feed_cfg in group:
             # 停止信号在两次调用之间生效：要么整源跳过，要么由 bridge 在源内部抛出
             if stop.is_set():
-                raise StopRequested()
+                out.append((feed_cfg, None, StopRequested()))
+                break
             try:
-                r = _run_feed(feed_cfg, cfg, bridge, force=args.force)
+                r = _run_feed(feed_cfg, cfg, bridges.get(key), force=args.force)
+            except StopRequested as e:
+                out.append((feed_cfg, None, e))
+                break
+            except Exception as e:
+                out.append((feed_cfg, None, e))
+            else:
+                out.append((feed_cfg, r, None))
+        return out
+
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="feed")
+    try:
+        futures = {
+            executor.submit(run_group, key, group): key
+            for key, group in groups.items()
+        }
+        for fut in as_completed(futures):
+            try:
+                results = fut.result()
+            except StopRequested:
+                interrupted = True
+                continue
+            except Exception as e:
+                # run_group 里已经兜过单个源的异常，走到这里基本是代码问题；
+                # 记成整组失败，别让线程池的异常把整轮中断掉。
+                group = groups[futures[fut]]
+                failed += len(group)
+                print(f"[{group[0].id}] 组内抓取失败: {e}", file=sys.stderr)
+                continue
+
+            for feed_cfg, r, err in results:
+                if isinstance(err, StopRequested):
+                    interrupted = True
+                    continue
+                if err is not None:
+                    failed += 1
+                    print(f"[{feed_cfg.id}] 失败: {err}", file=sys.stderr)
+                    continue
+
                 extras = [f"共 {r['total']} 条"]
                 if r["dropped"]:
                     extras.append(f"过滤 {r['dropped']} 条")
@@ -564,25 +678,34 @@ def main(argv: list[str] | None = None) -> int:
                     if r["new_visible"]:
                         name = feed_cfg.title or feed_cfg.id
                         news.append(f"{name} +{r['new_visible']}")
-            except StopRequested:
-                raise
-            except Exception as e:
-                failed += 1
-                print(f"[{feed_cfg.id}] 失败: {e}", file=sys.stderr)
     except (KeyboardInterrupt, StopRequested):
         # 被 pm2 cron_restart / Ctrl-C / kill 打断（关机、手动重跑等）：不打 traceback
         # 污染日志，但仍然走下面的清理。KeyboardInterrupt 还留着兜底 —— 信号 handler
         # 之外（比如非主线程）抛出来的中断也得收干净。
         interrupted = True
-        print("[中断] 收到停止信号，正在清理本次打开的标签页...", file=sys.stderr)
     finally:
-        # 收尾：只关掉本 session（本次运行）打开的标签页，用户自己的页面不受影响；
+        # 中断可能来自任意一个 worker（StopRequested 作为 future 的异常返回），
+        # 也可能直接打断主线程；统一在这里报一次，别漏掉。
+        if interrupted:
+            print("[中断] 收到停止信号，正在清理本次打开的标签页...", file=sys.stderr)
+            # 先让还没开工的任务别开工，再等已经在跑的任务收尾（它们会在下一次
+            # 调用前看到停止标志）。不等它们就跑清理的话，收完尾的源可能又打开
+            # 新标签页。
+            stop.set()
+        executor.shutdown(wait=True, cancel_futures=interrupted)
+
+        # 收尾：只关掉本次运行各 session 打开的标签页，用户自己的页面不受影响；
         # daemon 不在线时静默跳过。清理期间忽略信号 —— 第二个信号（pm2 等不及时的
         # SIGKILL 之前那一发）不该把清理打断，否则标签页就漏在浏览器里了。
-        if close_tabs and bridge is not None:
+        if close_tabs and bridges:
             _mute_signals()
+            closed = 0
+            left: list[dict] = []
             try:
-                closed, left = bridge.close_session()
+                for bridge in bridges.values():
+                    c, remaining = bridge.close_session()
+                    closed += c
+                    left.extend(remaining)
             finally:
                 # 收完把 handler 装回去：此时 stop 已置位，再收到信号就是强制退出 ——
                 # 别让后面发通知（osascript，最长 15s）这段没人杀得动。

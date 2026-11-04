@@ -156,6 +156,7 @@ rm state/*.json && ./main.sh
 | `image_digest_size` / `image_digest_max_age_hours` | 下次运行。**正文会跟着重渲染，但已经分好的批次不会重排** —— 要重来就删掉 state 里那些 `extra.kind == "image_digest"` 的条目 |
 | `digest_size` / `digest_max_age_hours`（ithome） | 下次运行。已经分好的合集不会重排 —— 要重来就删掉 state 里 `extra.kind == "ithome_digest"` 的条目 |
 | `max_pages` / `fulltext` / `max_fulltext_per_run` | 下次运行 |
+| `concurrency` | 下次运行（每轮启动时读配置，不用重启 pm2） |
 | `mode` / `entry_name` / `limit` / `token` | 下次运行（换 `entry_name` 相当于换一个源，建议连同 `id` 一起改，别让两个分类共用一份 state） |
 | 标题格式、正文结构这类**渲染逻辑**的改动 | 要 `./main.sh force` |
 
@@ -450,6 +451,26 @@ pm2 logs local-rss-hub               # hub 侧的验签 / 抓取 / 推送全过�
 | `./main.sh ping` 报「连不上 hub」 | hub 没起来，或 `hub_url` 写错 |
 | hub 日志里说「抓 feed 失败」 | `curl <base_url>/<feed-id>.xml` 试一下 —— 抓不到这个地址，后面全都是白搭 |
 
+## 并发抓取
+
+`config.yaml` 顶层 `concurrency`（默认 1）控制同时跑几个源：
+
+```yaml
+concurrency: 3
+```
+
+- 抓取时间几乎都花在等网络（列表接口、全文页面、公众号正文），并发能把一轮的
+  总耗时从「各源相加」压到接近「最慢的那个站点」。同一个源内部仍然是串行的。
+- **并发单位是站点，不是源**。同一个站点上的多个源共用一个 session/标签页、组内
+  串行 —— 知乎的四个动态源照旧只用一页（登录 cookie 是浏览器级的，页面只是给
+  `fetch` 提供同源上下文；哪个知乎页面都一样）。不同站点之间才同时跑，因为
+  WebBridge 的 `evaluate`/`navigate` 作用于 session 的当前标签页，同站两个源同时
+  跑会互相把页面切走。`concurrency: 1` 时仍沿用 `bridge.session`，行为和以前一样。
+- 抓取顺序不再固定。跨源去重（ithome 读 `xiaomi-new.xml`）拿到的是本轮之前或
+  本轮的**完整**文件 —— feed 是原子替换写的，不会读到半截 XML。
+- 并发太高会更容易撞上站点风控（尤其是知乎），3~4 是实测比较稳的范围。
+- `--clean` 会把这些按站点分的 session 里的残留标签页一起清掉。
+
 ## 标签页清理
 
 抓取需要真实页面来带登录态，所以每次运行都会新开标签页（归在 `bridge.group_title` 这个标签组下）。
@@ -459,9 +480,12 @@ pm2 logs local-rss-hub               # hub 侧的验签 / 抓取 / 推送全过�
 [清理] 关闭本次打开的 2 个标签页
 ```
 
-只会关掉本 session（`bridge.session`）里的标签页，**不会碰你自己已经打开的 B 站/知乎页面**：
+只会关掉本次运行用到的 session 里的标签页（`concurrency: 1` 时就是
+`bridge.session`；并发时每个**站点**一个 `local-rss-<站点>` session，
+同站的源共用一页），
+**不会碰你自己已经打开的 B 站/知乎页面**：
 脚本从不复用你手开的页面（`find_tab` 默认只在本 session 内查找，也不会借用你当前正在看的标签页），
-只用 `newTab` 新开自己的；收尾的 `close_session` 也只清空本 session 的标签组。
+只用 `newTab` 新开自己的；收尾的 `close_session` 也只清空这些 session 的标签组。
 
 ### 什么时候会漏：信号正好打在「新开标签页」那一下
 
@@ -642,6 +666,10 @@ bridge:
   group_title: 本地 RSS                 # 标签组显示名
   close_session: true                   # 跑完关掉本次打开的标签页
   browser: Google Chrome                # 浏览器没窗口时自动打开哪个（留空 = 不自动开）
+
+# 同时抓几个源（1 = 串行；默认 1）。并发时每个浏览器源用一个独立 session/标签页，
+# 见「并发抓取」一节。
+concurrency: 3
 
 output:
   dir: output        # RSS 输出目录（相对 config.yaml 所在目录）
