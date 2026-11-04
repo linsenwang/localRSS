@@ -60,7 +60,7 @@ ensure_webbridge || exit 1
 # 等几秒后写一个请求文件，由 SwiftBar 插件去触发 NetNewsWire 刷新。
 # 这样定时任务不需要自己拿辅助功能权限，只要 SwiftBar 有权限即可。
 refresh_netnewswire() {
-  local delay="${NNW_REFRESH_DELAY:-5}"
+  local delay="${NNW_REFRESH_DELAY:-0}"
   local plugin_name="${NNW_PLUGIN_NAME:-netnewswire_unread.1m.py}"
   local request_file="${HOME}/Library/Caches/swiftbar-netnewswire.request"
 
