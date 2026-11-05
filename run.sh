@@ -82,7 +82,10 @@ ensure_webbridge || exit 1
 # 请求文件就永远没人消费。所以这里等一会儿，发现没被消费就重启 SwiftBar 再试。
 refresh_netnewswire() {
   local delay="${NNW_REFRESH_DELAY:-0}"
-  local plugin_name="${NNW_PLUGIN_NAME:-netnewswire_unread.1m.py}"
+  # SwiftBar 2.1.x 的 refreshplugin 认插件 id（完整路径）或 name（文件名第一个
+  # 点之前那段），不认带扩展名的文件名；2.0.1 也认 name，所以这里用 name，
+  # 两个版本都能命中。插件改名的话用 NNW_PLUGIN_NAME 覆盖。
+  local plugin_name="${NNW_PLUGIN_NAME:-netnewswire_unread}"
   local request_file="${HOME}/Library/Caches/swiftbar-netnewswire.request"
 
   if ! pgrep -x NetNewsWire >/dev/null 2>&1; then
@@ -116,7 +119,15 @@ refresh_netnewswire() {
     return 0
   fi
 
-  log "SwiftBar 15 秒内没有处理刷新请求，可能卡住了，重启一次"
+  # URL 没反应不代表卡死：插件自己每分钟也会跑一轮。等它的下一次定时，
+  # 免得把正常但没被 URL 命中的 SwiftBar 误杀。
+  log "SwiftBar 没有立即处理刷新请求，等下一轮插件定时执行"
+  if wait_consumed 60; then
+    log "NetNewsWire 刷新请求已由定时插件处理"
+    return 0
+  fi
+
+  log "SwiftBar 超过 75 秒没有执行任何插件，可能卡住了，重启一次"
   # 卡住的现场留一份调用栈，下次能看出是卡在菜单、插件还是主线程（logs/ 里）。
   local swiftbar_pid
   swiftbar_pid="$(pgrep -x SwiftBar | head -1)"
