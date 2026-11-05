@@ -4,6 +4,7 @@ output/*.tmp
 state/*.json
 state/*.tmp
 logs/*.log
+logs/*.sample.txt
 archive/
 
 # Python

@@ -117,6 +117,14 @@ refresh_netnewswire() {
   fi
 
   log "SwiftBar 15 秒内没有处理刷新请求，可能卡住了，重启一次"
+  # 卡住的现场留一份调用栈，下次能看出是卡在菜单、插件还是主线程（logs/ 里）。
+  local swiftbar_pid
+  swiftbar_pid="$(pgrep -x SwiftBar | head -1)"
+  if [ -n "$swiftbar_pid" ]; then
+    sample "$swiftbar_pid" 1 \
+      -file "$SCRIPT_DIR/logs/swiftbar-hang-$(date '+%Y%m%d-%H%M%S').sample.txt" \
+      >/dev/null 2>&1 || true
+  fi
   pkill -x SwiftBar 2>/dev/null || true
   local i
   for i in $(seq 1 10); do
