@@ -77,6 +77,9 @@ ensure_webbridge || exit 1
 # local_rss 写完 feed 并通知 hub 后，FreshRSS 还需要一点时间拉取。
 # 等几秒后写一个请求文件，由 SwiftBar 插件去触发 NetNewsWire 刷新。
 # 这样定时任务不需要自己拿辅助功能权限，只要 SwiftBar 有权限即可。
+#
+# SwiftBar 偶尔会把主线程卡死：插件不再执行、连 AppleEvent 退出都不处理，
+# 请求文件就永远没人消费。所以这里等一会儿，发现没被消费就重启 SwiftBar 再试。
 refresh_netnewswire() {
   local delay="${NNW_REFRESH_DELAY:-0}"
   local plugin_name="${NNW_PLUGIN_NAME:-netnewswire_unread.1m.py}"
@@ -91,9 +94,50 @@ refresh_netnewswire() {
   sleep "$delay"
 
   mkdir -p "$(dirname "$request_file")"
-  date +%s > "$request_file"
-  open "swiftbar://refreshplugin?name=${plugin_name}" >/dev/null 2>&1 || true
-  log "已请求 SwiftBar 刷新 NetNewsWire"
+
+  write_request() { date +%s > "$request_file"; }
+  ask_swiftbar() {
+    open "swiftbar://refreshplugin?name=${plugin_name}" >/dev/null 2>&1 || true
+  }
+  # 插件读到请求文件会立刻删掉；文件还在 = SwiftBar 没把插件跑起来。
+  wait_consumed() {
+    local i
+    for i in $(seq 1 "$1"); do
+      [ -f "$request_file" ] || return 0
+      sleep 1
+    done
+    return 1
+  }
+
+  write_request
+  ask_swiftbar
+  if wait_consumed 15; then
+    log "已请求 SwiftBar 刷新 NetNewsWire"
+    return 0
+  fi
+
+  log "SwiftBar 15 秒内没有处理刷新请求，可能卡住了，重启一次"
+  pkill -x SwiftBar 2>/dev/null || true
+  local i
+  for i in $(seq 1 10); do
+    pgrep -x SwiftBar >/dev/null || break
+    sleep 0.5
+  done
+  if pgrep -x SwiftBar >/dev/null; then
+    # 卡死的进程未必响应 SIGTERM，等 5 秒还不退就强杀
+    pkill -9 -x SwiftBar 2>/dev/null || true
+    sleep 1
+  fi
+  open -a SwiftBar >/dev/null 2>&1 || true
+  sleep 3
+
+  write_request
+  ask_swiftbar
+  if wait_consumed 15; then
+    log "SwiftBar 已重启，NetNewsWire 刷新请求已处理"
+  else
+    log "重启 SwiftBar 后仍没处理刷新请求，本轮跳过 NetNewsWire 刷新"
+  fi
 }
 
 # 透传参数：run.sh zhihu-kvxjr369f 等
