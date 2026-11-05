@@ -15,8 +15,9 @@
 #   ./main.sh log [行数]         看最近抓取日志（默认 20 行）
 #   ./main.sh restart|stop|start 控制 pm2 里的定时抓取任务
 #
-# 刷新成功后会等 5 秒（NNW_REFRESH_DELAY 可改）再让 SwiftBar 插件触发
-# NetNewsWire 刷新，给 FreshRSS 留出拉取 local_rss 更新的时间。
+# 抓取结束后会让 SwiftBar 插件触发 NetNewsWire 刷新（个别源失败、其余源已
+# 更新时也会）；需要给 FreshRSS 留拉取时间时用 NNW_REFRESH_DELAY 加等待，
+# 默认 0 秒。
 #
 # force 和普通刷新的区别：
 #   普通刷新是增量的 —— 从第 1 页开始，整页都是已有记录就停止翻页，通常 1 秒结束。

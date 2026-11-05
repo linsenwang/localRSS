@@ -8,6 +8,9 @@
 # 浏览器没窗口（扩展会掉线）不在这里管 —— rss.py 的 check_bridge 会按
 # config.yaml 的 bridge.browser 自己把窗口开出来。
 # 标签页清理由 rss.py 自己负责（结束时 close_session），这里不用管。
+#
+# 同一时间只跑一个实例：pm2 的 cron_restart 偶尔会在分钟边界连发两次
+# （:01:59 和 :02:00），第二次会和第一次抢 WebBridge 的标签页，整轮都失败。
 
 set -uo pipefail
 
@@ -21,6 +24,21 @@ WEBBRIDGE_BIN="${HOME}/.kimi-webbridge/bin/kimi-webbridge"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# 单实例锁。flock 挂在 fd 9 上，锁会跟着这个 shell 活到脚本退出；重复触发
+# 的那次拿不到锁就直接走人，别去抢已经在跑的那次开出来的标签页。
+LOCK_FILE="${TMPDIR:-/tmp}/local-rss-run.lock"
+exec 9>"$LOCK_FILE"
+lock_rc=0
+"$PYTHON" -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(75)' 2>/dev/null || lock_rc=$?
+if [ "$lock_rc" -eq 75 ]; then
+  log "已有一次刷新在跑，跳过本次重复触发"
+  exit 0
+fi
 
 if [ ! -x "$WEBBRIDGE_BIN" ]; then
   log "错误：找不到 $WEBBRIDGE_BIN"
@@ -82,9 +100,11 @@ refresh_netnewswire() {
 "$PYTHON" "$SCRIPT_DIR/rss.py" "$@"
 ec=$?
 
-if [ "$ec" -ne 0 ]; then
-  log "刷新失败（退出码 ${ec}）"
-else
+# 退出码 1 = 部分源失败，但其余源已经写完、hub 也通知过了。这种也要让阅读器
+# 刷新 —— 否则一个源抽风就会把整轮更新挡在阅读器外面。
+if [ "$ec" -eq 0 ] || [ "$ec" -eq 1 ]; then
   refresh_netnewswire
+else
+  log "抓取未完成（退出码 ${ec}），跳过 NetNewsWire 刷新"
 fi
 exit "$ec"
