@@ -515,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         for i, session in enumerate(sessions):
             bridge = Bridge(
                 url=cfg.bridge_url, session=session, browser=cfg.browser,
-                window=cfg.window, stop=stop.is_set,
+                stop=stop.is_set,
             )
             if i == 0:
                 try:
@@ -577,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     if any(_needs_browser(f, types) for f in feeds):
         probe = Bridge(
             url=cfg.bridge_url, session=cfg.session, browser=cfg.browser,
-            window=cfg.window, stop=stop.is_set,
+            stop=stop.is_set,
         )
         try:
             check_bridge(probe)
@@ -593,7 +593,7 @@ def main(argv: list[str] | None = None) -> int:
             bridges[key] = Bridge(
                 url=cfg.bridge_url,
                 session=_group_session(cfg.session, key, concurrency),
-                browser=cfg.browser, window=cfg.window, stop=stop.is_set,
+                browser=cfg.browser, stop=stop.is_set,
             )
 
     close_tabs = cfg.close_session and not args.keep_tabs
