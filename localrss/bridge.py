@@ -19,6 +19,10 @@ DEFAULT_URL = "http://127.0.0.1:10086/command"
 DEFAULT_BROWSER = "Google Chrome"
 #: 开完浏览器后等扩展连上的上限（秒）
 CONNECT_TIMEOUT_S = 30
+#: 专用窗口里用来认领它的占位标签页（永远不会被导航走）
+WINDOW_MARKER = "about:blank#local-rss"
+#: 专用窗口的大小；平时是隐藏的，只有手动取消隐藏才看得到
+WINDOW_BOUNDS = (40, 60, 440, 380)
 
 
 def same_page(a: str, b: str) -> bool:
@@ -30,6 +34,141 @@ def same_page(a: str, b: str) -> bool:
     if not pa.netloc or pa.netloc != pb.netloc:
         return False
     return pa.path.rstrip("/") == pb.path.rstrip("/")
+
+
+def _apple_string(value: str) -> str:
+    """把字符串塞进 AppleScript 的双引号里。"""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _osascript(script: str, timeout: int = 25, quiet: bool = False) -> str | None:
+    """跑一段 AppleScript；失败返回 None（默认打一行 stderr，quiet 时闭嘴）。"""
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        if not quiet:
+            print(f"AppleScript 执行失败：{e}", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip()
+        if detail and not quiet:
+            print(f"AppleScript 执行失败：{detail}", file=sys.stderr)
+        return None
+    return proc.stdout.strip()
+
+
+def _chrome_only(app: str) -> bool:
+    """专用窗口只对 macOS 上的 Chrome 系浏览器实现（AppleScript 那套接口）。"""
+    return sys.platform == "darwin" and "chrome" in app.lower()
+
+
+def _frontmost_app() -> str:
+    """前台应用名。
+
+    用 lsappinfo 而不是 System Events：后者会要求「控制 System Events」的自动化
+    授权，定时任务里弹这个框就太打扰了。
+    """
+    if sys.platform != "darwin":
+        return ""
+    try:
+        front = subprocess.run(
+            ["lsappinfo", "front"], capture_output=True, text=True, timeout=10
+        )
+        if front.returncode != 0:
+            return ""
+        asn = front.stdout.strip()
+        if not asn:
+            return ""
+        info = subprocess.run(
+            ["lsappinfo", "info", "-only", "name", asn],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    line = info.stdout.strip()
+    marker = '"LSDisplayName"='
+    if marker not in line:
+        return ""
+    return line.split(marker, 1)[1].strip().strip('"')
+
+
+def _activate_app(name: str) -> None:
+    """把原来的前台应用还回去（`open -a` 不经过 AppleScript，不触发自动化授权）。"""
+    if not name or name in ("loginwindow", "Window Server", "Dock"):
+        return
+    try:
+        subprocess.run(
+            ["open", "-a", name], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def open_dedicated_window(app: str) -> str | None:
+    """确保专用窗口存在并隐藏起来，返回窗口 id。
+
+    窗口里常驻一个 ``about:blank#local-rss`` 标签页当认领标记。新建窗口时
+    Chrome 会把自己带到前台，所以调用方要负责把原来的前台应用还回去。
+    最后是「先 index 再 visible」：反过来的话，index 会把隐藏窗口又显示出来。
+    """
+    if not _chrome_only(app):
+        return None
+    x1, y1, x2, y2 = WINDOW_BOUNDS
+    script = f"""
+tell application {_apple_string(app)}
+    set foundId to 0
+    repeat with i from 1 to count of windows
+        set w to window i
+        repeat with t in tabs of w
+            if URL of t is "{WINDOW_MARKER}" then
+                set foundId to id of w
+                exit repeat
+            end if
+        end repeat
+        if foundId is not 0 then exit repeat
+    end repeat
+    if foundId is 0 then
+        set w to make new window
+        set URL of active tab of w to "{WINDOW_MARKER}"
+        delay 0.4
+        set foundId to id of w
+    end if
+    set w to first window whose id is foundId
+    set bounds of w to {{{x1}, {y1}, {x2}, {y2}}}
+    if id of window 1 is not foundId then set index of w to 1
+    set visible of w to false
+    return foundId as string
+end tell
+"""
+    return _osascript(script)
+
+
+def steer_new_tabs(app: str, window_id: str) -> bool:
+    """让下一个新标签页落进专用窗口，同时把窗口重新藏起来。
+
+    ``chrome.tabs.create``（WebBridge 的 ``navigate`` 用的就是它）不带 windowId 时
+    会落在「最近聚焦的窗口」。AppleScript 的 ``set index`` 是这里唯一能改这个
+    「最近聚焦」又不用真的切换应用的办法；它会把窗口显示出来，所以紧接着
+    再藏回去 —— 两条命令在同一次 AppleScript 里，窗口基本来不及闪。
+    """
+    if not _chrome_only(app) or not window_id:
+        return False
+    script = f"""
+tell application {_apple_string(app)}
+    try
+        set w to first window whose id is {window_id}
+    on error
+        return "missing"
+    end try
+    if id of window 1 is not {window_id} then set index of w to 1
+    set visible of w to false
+    return "ok"
+end tell
+"""
+    return _osascript(script, quiet=True) == "ok"
 
 
 def _error_detail(e: urllib.error.HTTPError) -> str:
@@ -60,6 +199,7 @@ class Bridge:
         session: str = "local-rss",
         timeout: int = 120,
         browser: str = "",
+        window: bool = False,
         stop=None,
     ):
         self.url = url
@@ -67,6 +207,10 @@ class Bridge:
         self.timeout = timeout
         #: 浏览器没窗口（扩展掉线）时自动打开的应用名，空字符串 = 不自动开
         self.browser = browser
+        #: 把抓取标签页放进一个专用隐藏窗口（不混进用户自己的窗口，也不抢前台）
+        self.window = window
+        #: 专用窗口的 id；None = 还没建/建不出来
+        self.window_id: str | None = None
         #: 返回 True = 该收工了（定时任务收到 SIGINT/SIGTERM 时置位）。
         #: 只在调用**开工前**检查它，这样已经发出去的调用能正常收尾，见 try_call。
         self.stop = stop
@@ -129,16 +273,56 @@ class Bridge:
         except (urllib.error.URLError, OSError, ValueError):
             return None
 
+    def prepare_window(self) -> None:
+        """准备好专用隐藏窗口（只在 window 模式且是 Chrome 时生效）。
+
+        没有窗口的话扩展会掉线，所以这个窗口平时一直留着（里面只有一个占位
+        标签页）；跑完只关本次 session 的标签页，不动它。
+        """
+        if not (self.window and _chrome_only(self.browser)):
+            return
+        before = _frontmost_app()
+        self.window_id = open_dedicated_window(self.browser)
+        if self.window_id is None:
+            return
+        # 新建窗口会把 Chrome 带到前台；原来前台的不是它，就还回去
+        if before and before.lower() != self.browser.lower():
+            if _frontmost_app().lower() == self.browser.lower():
+                _activate_app(before)
+
+    def _steer_new_tab(self) -> None:
+        """让下一个新标签页落进专用窗口（见 steer_new_tabs）。"""
+        if not (self.window and _chrome_only(self.browser)):
+            return
+        if self.window_id is None:
+            self.prepare_window()
+        if self.window_id is None:
+            return
+        if steer_new_tabs(self.browser, self.window_id):
+            return
+        # 专用窗口被关了/换 id 了：重建一次，再定位
+        self.window_id = None
+        self.prepare_window()
+        if self.window_id is not None:
+            steer_new_tabs(self.browser, self.window_id)
+
     def open_browser(self, app: str) -> bool:
-        """打开浏览器窗口（macOS 的 `open -a`），返回是否成功。
+        """把浏览器拉起来（macOS 的 `open -a`），返回是否成功。
 
         浏览器进程在「最后一个窗口被关掉」之后还会留在后台，但扩展的连接跟着
         窗口一起没了、且不会自己重连 —— 开个窗口是让它回来的唯一办法。
         浏览器根本没在跑时，这一下也会把它启动起来。
+
+        窗口模式下加 `-g`：只启动进程，不把浏览器带到前台。浏览器已经在跑、
+        只是没有窗口时这一下是空操作，后面的 prepare_window 会建专用窗口。
         """
+        args = ["open"]
+        if self.window and _chrome_only(app):
+            args.append("-g")
+        args += ["-a", app]
         try:
             proc = subprocess.run(
-                ["open", "-a", app], capture_output=True, text=True, timeout=30
+                args, capture_output=True, text=True, timeout=30
             )
         except (OSError, subprocess.SubprocessError) as e:
             print(f"打开浏览器 {app!r} 失败：{e}", file=sys.stderr)
@@ -165,6 +349,7 @@ class Bridge:
         data = self.try_call("find_tab", {"url": url})
         if data is None:
             # 本 session 里根本没有这个站点的标签页：新开一个，不动用户自己的页面
+            self._steer_new_tab()
             print(f"    [标签页] 新开 {url}", file=sys.stderr)
             self.call("navigate", {"url": url, "newTab": True})
             return
@@ -254,8 +439,12 @@ def check_bridge(bridge: Bridge) -> None:
     浏览器进程还在后台跑，`kimi-webbridge status` 也照旧说 running，但每个调用
     都会回 "no extension connected" —— 定时任务最容易踩这个，没人手动开窗口的话
     那一轮就白跑了。所以这里补一步：打开窗口，再等扩展自己连回来。
+
+    `bridge.window` 打开时，窗口是一个专用的隐藏窗口（见 prepare_window），
+    不混进用户自己的窗口，也不把浏览器抢到前台。
     """
     if bridge.ping():
+        bridge.prepare_window()
         return
 
     if bridge.daemon_status() is None:
@@ -270,6 +459,9 @@ def check_bridge(bridge: Bridge) -> None:
     if bridge.browser:
         print(f"浏览器扩展未连接，打开 {bridge.browser} ...", file=sys.stderr)
         if bridge.open_browser(bridge.browser):
+            # 进程在跑但一个窗口都没有时，`open -a` 是空操作：
+            # 专用窗口建出来，扩展才有东西可连
+            bridge.prepare_window()
             deadline = time.monotonic() + CONNECT_TIMEOUT_S
             while time.monotonic() < deadline:
                 time.sleep(1)

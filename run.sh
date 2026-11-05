@@ -6,7 +6,8 @@
 #   2. 先确认 WebBridge daemon 在跑，没跑就拉起来
 #
 # 浏览器没窗口（扩展会掉线）不在这里管 —— rss.py 的 check_bridge 会按
-# config.yaml 的 bridge.browser 自己把窗口开出来。
+# config.yaml 的 bridge.browser 自己把窗口开出来（默认是一个隐藏的专用窗口，
+# 不混进主窗口、不抢前台，见 bridge.window）。
 # 标签页清理由 rss.py 自己负责（结束时 close_session），这里不用管。
 
 set -uo pipefail

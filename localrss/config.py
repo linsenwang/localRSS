@@ -41,6 +41,8 @@ class Config:
     group_title: str
     #: 浏览器没窗口（扩展掉线）时自动打开的应用名，空字符串 = 不自动开
     browser: str
+    #: 抓取标签页是否放进专用隐藏窗口（true = 不混进用户自己的窗口、不抢前台）
+    window: bool
     output_dir: Path
     state_dir: Path
     log_dir: Path
@@ -83,6 +85,15 @@ def _browser_name(value) -> str:
     if value in (None, False):
         return ""
     return str(value).strip()
+
+
+def _window_mode(value) -> bool:
+    """config 里的 bridge.window：没写 / true / hidden = 专用隐藏窗口；false = 不用。"""
+    if value in (None, True):
+        return True
+    if value is False:
+        return False
+    return str(value).strip().lower() not in ("", "false", "off", "no", "0", "none")
 
 
 def load_config(path: str | Path) -> Config:
@@ -138,6 +149,8 @@ def load_config(path: str | Path) -> Config:
         group_title=bridge_cfg.get("group_title") or "本地 RSS",
         # 没写这个键 = 用默认浏览器；显式写成空/false = 关掉自动打开
         browser=_browser_name(bridge_cfg.get("browser", DEFAULT_BROWSER)),
+        # 没写这个键 = 开：抓取标签页进专用隐藏窗口；写 false 才退回当前窗口
+        window=_window_mode(bridge_cfg.get("window", "hidden")),
         output_dir=resolve(output_cfg.get("dir"), "output"),
         state_dir=resolve(output_cfg.get("state_dir"), "state"),
         log_dir=resolve(output_cfg.get("log_dir"), "logs"),

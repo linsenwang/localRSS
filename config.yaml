@@ -18,6 +18,11 @@ bridge:
   # 扩展的连接会随最后一个窗口一起消失、且不会自己重连，这时所有抓取都会报
   # "no extension connected" —— 定时任务最容易踩。留空 = 不自动开，直接报错。
   browser: Google Chrome
+  # 抓取用的标签页放进一个专用的小窗口里（隐藏起来，不抢前台），不混进你
+  # 正在用的窗口。窗口里常驻一个 about:blank#local-rss 占位页；每轮跑完只关
+  # 本次开的标签页，窗口留着 —— 扩展也就不会因为「没有窗口」掉线。
+  # 只在 macOS + Chrome 上有这个效果；写 false 退回「开在当前窗口」。
+  window: hidden
 
 output:
   dir: output          # RSS 文件输出目录（相对本文件所在目录）
