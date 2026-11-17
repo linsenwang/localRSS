@@ -17,7 +17,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 from ..bridge import Bridge, same_page
 from ..models import Item, sort_key
@@ -207,8 +207,10 @@ def _short_hash(s: str, length: int = 6) -> str:
 # ---------- 全文抓取 ----------
 #
 # 逻辑照搬 kvxjr369f/zhihu_fulltext.py：导航到内容页、等渲染、从 DOM 里取正文。
-# 回答/文章页面的 API 拿不到内容（article 直接 403「请求参数异常」），
-# 想法页又会被随机重定向，所以页面抓取是最省事的办法。
+# 文章页的 API 直接 403「请求参数异常」，想法页又会被随机重定向，所以页面抓取
+# 是最省事的办法。同源的页面（回答、问题描述）先试 fetch + DOMParser 直取
+# 服务端渲染的 HTML（见 _fetch_page_js）—— 正文和参考文献都在里面，比整页
+# 导航快一个数量级；跨源、折叠或取不到时才退回导航。
 
 # 每种类型的标题 / 正文选择器，按顺序 fallback
 FULLTEXT_SELECTORS: dict[str, tuple[list[str], list[str]]] = {
@@ -374,6 +376,60 @@ def _extract_js(title_selectors: list[str], content_selectors: list[str]) -> str
             collapsed: !!(last.node && last.node.closest('.QuestionRichText--collapsed')),
         }};
     }})()
+    """
+
+
+#: 直接 fetch 页面 HTML、在 DOMParser 里取正文（见 _from_fetched_page）。
+#:
+#: 为什么不一律走 navigate：答案页的 load 事件要等广告和统计脚本，实测 6 秒左右，
+#: 而正文（包括文末的参考文献列表）在服务端渲染的 HTML 里已经是完整的 ——
+#: fetch 一次只要 0.3~0.5 秒。只有同源页面能这么取（从 www.zhihu.com 去 fetch
+#: zhuanlan.zhihu.com 会被 CORS 拦掉），跨源时返回 `cross-origin`，交给原来的
+#: 导航路径。折叠的正文（「阅读全文」/「显示全部」没点开）也交回导航路径。
+FETCH_PAGE_TIMEOUT_MS = 15000
+
+
+def _fetch_page_js(content_selectors: list[str]) -> str:
+    contents = json.dumps(list(content_selectors))
+    return f"""
+    async (url) => {{
+        const contentSelectors = {contents};
+        const minLen = {MIN_CONTENT_LEN};
+        const timeoutMs = {FETCH_PAGE_TIMEOUT_MS};
+        try {{
+            if (new URL(url).origin !== location.origin) {{
+                return {{ ok: false, reason: 'cross-origin' }};
+            }}
+        }} catch (e) {{
+            return {{ ok: false, reason: String(e) }};
+        }}
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {{
+            const r = await fetch(url, {{ credentials: 'include', signal: controller.signal }});
+            if (!r.ok) return {{ ok: false, reason: 'HTTP ' + r.status }};
+
+            const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+            let node = null;
+            for (const sel of contentSelectors) {{
+                const el = doc.querySelector(sel);
+                if (el && el.innerHTML.length > minLen) {{ node = el; break; }}
+            }}
+            if (!node) return {{ ok: false, reason: '未找到页面正文' }};
+
+            // 折叠的正文是半截，宁可回导航路径点开「阅读全文」/「显示全部」。
+            const collapsed = !!(
+                node.closest('.QuestionRichText--collapsed')
+                || doc.querySelector('.ContentItem-expandButton')
+            );
+            return {{ ok: true, content: node.innerHTML, collapsed, finalUrl: r.url }};
+        }} catch (e) {{
+            return {{ ok: false, reason: String(e) }};
+        }} finally {{
+            clearTimeout(timer);
+        }}
+    }}
     """
 
 
@@ -1334,7 +1390,47 @@ class ZhihuProvider(Provider):
                 return self._pin_api(bridge, item_id)
             except RuntimeError:
                 pass
+        # 同源页面先直取 HTML（见 _fetch_page_js）：比整页导航快一个数量级。
+        # 取不到 / 折叠 / 跨源时返回 None，退回下面的导航路径，行为不变。
+        fast = self._from_fetched_page(bridge, item_type, url)
+        if fast is not None:
+            return fast
         return self._from_page(bridge, item_type, url)
+
+    def _from_fetched_page(self, bridge: Bridge, item_type: str, url: str) -> str | None:
+        """用 fetch + DOMParser 取正文；不适用时返回 None（交给 _from_page）。
+
+        只处理同源页面：当前标签页和 url 不同源时直接放弃（交叉源 fetch 会被
+        CORS 拦掉，等它失败也是白等）。答案页的 SSR HTML 里正文和参考文献
+        都是全的，和导航后从 DOM 取到的内容一致（实测逐字相同）。
+        """
+        selectors = FULLTEXT_SELECTORS.get(item_type)
+        if selectors is None:
+            return None
+        _, content_sels = selectors
+        target_host = urlsplit(url).hostname or ""
+        host = str(bridge.evaluate("location.hostname") or "")
+        if not target_host or host != target_host:
+            return None
+
+        val = bridge.evaluate(f"({_fetch_page_js(content_sels)})({json.dumps(url)})")
+        if not val or not val.get("ok"):
+            reason = (val or {}).get("reason") or "空返回"
+            # 问题没有描述时页面上本来就没有正文，不算失败；其他情况退回导航，
+            # 让 _from_page 按原来的规则判断（重定向、风控、折叠……）。
+            if item_type in OPTIONAL_CONTENT_TYPES and reason == "未找到页面正文":
+                return ""
+            print(f"    [全文] 直取页面失败（{reason}），改走页面渲染", file=sys.stderr)
+            return None
+        final_url = str(val.get("finalUrl") or "")
+        if final_url and not same_page(final_url, url):
+            # 回答被删/想法随机跳转时，落地页上可能是别人的正文
+            print(f"    [全文] 直取页面被重定向到 {final_url}，改走页面渲染", file=sys.stderr)
+            return None
+        if val.get("collapsed"):
+            print("    [全文] 页面正文是折叠的，改走页面渲染", file=sys.stderr)
+            return None
+        return _clean_zhihu_html(val.get("content", ""))
 
     def _from_page(self, bridge: Bridge, item_type: str, url: str) -> str:
         selectors = FULLTEXT_SELECTORS.get(item_type)
