@@ -722,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.notify and news:
         subtitle = f"{len(news)} 个源有新内容"
         body = " · ".join(news)
-        if notify.send("local_rss", body, subtitle):
+        if notify.send("local_rss", body, subtitle, cfg.notify_app):
             print(f"[通知] {subtitle}（{body}）")
     return 1 if failed else 0
 

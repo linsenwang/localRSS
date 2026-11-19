@@ -28,10 +28,14 @@ output:
   # 用来回头核对关键词规则有没有误伤。没有过滤掉的条目时也会写一个空清单，
   # 免得上一轮的内容留在文件里冒充本轮。
   dropped_log: true
-  # 抓完之后如果真有新条目，发一条 macOS 通知（系统通知中心，用 osascript 发）。
+  # 抓完之后如果真有新条目，发一条 macOS 通知（系统通知中心）。
   # 多个源有更新时汇总成一条，不会刷屏；没有新内容的那种常见运行不打扰你。
   # 想关掉写 false。注意这是 macOS 专有功能（Linux/Windows 上只会打一行失败日志）。
   notify: true
+  # 点通知时打开哪个应用（macOS 的 `open -a`，写应用名或 .app 路径）。
+  # 需要 terminal-notifier（brew install terminal-notifier）；没装就退回 osascript，
+  # 那条通知点了会打开「脚本编辑器」，这里配的应用不生效。
+  notify_app: NetNewsWire
   # 每个源最多保留多少条（默认值，可被各个 feed 的 history 覆盖）。
   # 注意这是「条数」上限，不按体积算：带全文的源每条体积大得多，所以单独调小了。
   # 这只影响 RSS 里显示多少条 —— 滚出窗口的条目不会丢，见下面的 archive。

@@ -56,8 +56,10 @@ class Config:
     exclude_keywords: list[str]
     #: 把每轮被过滤掉的条目写一份清单（logs/<feed-id>.dropped.log，覆盖写）
     dropped_log: bool
-    #: 抓完有新内容时发一条 macOS 通知（osascript）
+    #: 抓完有新内容时发一条 macOS 通知（terminal-notifier，退回 osascript）
     notify: bool
+    #: 点通知时打开的应用（应用名或 .app 路径）；空字符串 = 点击不做事
+    notify_app: str
     #: 同时抓几个源；1 = 串行。并发按站点分组，见 cli._group_key
     concurrency: int
     feeds: list[FeedConfig]
@@ -152,6 +154,8 @@ def load_config(path: str | Path) -> Config:
         dropped_log=bool(output_cfg.get("dropped_log", False)),
         # 没写这个键 = 开（抓完有新内容就提醒），写 false 才关
         notify=bool(output_cfg.get("notify", True)),
+        # 没写这个键 = 点击通知不打开应用（退回原来的行为）
+        notify_app=str(output_cfg.get("notify_app") or "").strip(),
         # 顶层 concurrency：同时抓几个源。默认 1 = 保持原来的串行行为。
         concurrency=max(1, int(raw.get("concurrency", 1) or 1)),
         exclude_keywords=[
