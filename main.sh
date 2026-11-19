@@ -19,6 +19,10 @@
 # 更新时也会）；需要给 FreshRSS 留拉取时间时用 NNW_REFRESH_DELAY 加等待，
 # 默认 0 秒。
 #
+# 手动优先级高于定时任务：撞上正在跑的那次刷新时，定时任务会跳过，而这里会
+# 先把它干掉再接管（后台那次可能已经卡住了）。不想接管就
+# `LOCAL_RSS_TAKEOVER=0 ./main.sh`。
+#
 # force 和普通刷新的区别：
 #   普通刷新是增量的 —— 从第 1 页开始，整页都是已有记录就停止翻页，通常 1 秒结束。
 #   force 假装本地什么都没有，翻满 max_pages 把所有页重抓一遍并重新渲染，
@@ -35,6 +39,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+# 手动入口：撞上正在跑的那次刷新时接管它（见 run.sh 的单实例锁）。
+export LOCAL_RSS_TAKEOVER="${LOCAL_RSS_TAKEOVER:-1}"
 
 PORT="$(grep -oE "PORT: *'[0-9]+'" ecosystem.config.js 2>/dev/null | grep -oE '[0-9]+' | head -1)"
 PORT="${PORT:-8666}"
