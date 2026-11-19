@@ -80,18 +80,29 @@ VERB_ACTIONS = {
 #   not_on_page  页面不在 www.zhihu.com 上（上一轮留下的 B 站标签页、刚开出来还没
 #                commit 的新标签页）。知乎的登录 cookie 是 SameSite=Lax，跨站发的
 #                请求一个都不带 —— 切回目标页面立刻重来就好（见 _fetch_page）。
-#   no_cookie    页面是对的，但浏览器这会儿没把登录 cookie 交给页面：冷启动、机器
-#                刚唤醒、登录态过期都会这样，通常一两分钟自己就好了（实测线上的
-#                失败窗口 80~125 秒）。这种等着才有用，切页面、换接口都没用。
+#   no_cookie    真没有登录态：接口失败后再探一次 /api/v4/me，401/403 才算。
+#                不能在 JS 里看 document.cookie —— 真正的登录 cookie `z_c0` 是
+#                HttpOnly，`SESSIONID` 又只挂在 `/people` 路径下；标签页切到
+#                `/notifications` 后 document.cookie 里没有 SESSIONID，但登录
+#                明明是好的。靠 cookie 名字判断会把正常登录误判成掉线。
 PAGE_CHECK_JS = r"""
     if (location.hostname !== 'www.zhihu.com') {
       return { ok: false, not_on_page: true,
                error: '当前标签页不在知乎页面上（' + location.href + '）' };
     }
-    if (document.cookie.indexOf('SESSIONID=') < 0) {
-      return { ok: false, no_cookie: true,
-               error: '浏览器里没有知乎的登录 cookie（' + location.href + '）' };
-    }
+"""
+
+#: 登录态探测。登录 cookie 是 HttpOnly，JS 看不到，只能问接口：
+#: /api/v4/me 200 = 登录中，401/403 = 没登录，其它（网络错误）判断不了。
+LOGIN_CHECK_JS = r"""
+(async () => {
+  try {
+    const r = await fetch('https://www.zhihu.com/api/v4/me', { credentials: 'include' });
+    return { logged_in: r.ok, status: r.status };
+  } catch (e) {
+    return { logged_in: null, error: String(e) };
+  }
+})()
 """
 
 EXTRACT_JS = r"""
@@ -431,6 +442,15 @@ def _fetch_page_js(content_selectors: list[str]) -> str:
         }}
     }}
     """
+
+
+def _logged_in(bridge: Bridge) -> bool | None:
+    """当前标签页的知乎登录态：True / False / None（探不出来）。
+
+    只用于「接口已经失败」之后区分原因，正常路径不会多发请求。
+    """
+    result = bridge.evaluate(LOGIN_CHECK_JS) or {}
+    return result.get("logged_in")
 
 
 #: 「浏览器暂时交不出知乎登录 cookie」这份耐心记在 bridge 上，同一次运行里的所有
@@ -1064,6 +1084,12 @@ class ZhihuProvider(Provider):
                       file=sys.stderr)
                 self.setup(bridge)
                 continue
+            if not result.get("no_cookie"):
+                # 接口失败不等于没登录（风控也是同一句话）。登录 cookie 是
+                # HttpOnly 的，看 document.cookie 判断不了，单独问一次 /api/v4/me。
+                if _logged_in(bridge) is False:
+                    result = dict(result, no_cookie=True,
+                                  error="知乎接口返回未登录（/api/v4/me 不是 200）")
             if result.get("no_cookie") and time.monotonic() < deadline:
                 # 页面没问题，是浏览器这边暂时交不出登录 cookie（冷启动、刚唤醒最
                 # 典型）。在原地快重试没用（线上就是这么三连失败的），这里拉长间隔
@@ -1071,7 +1097,7 @@ class ZhihuProvider(Provider):
                 # 注意别在这里 reload 页面：那是用户正在看的窗口，反复刷新很难受，
                 # 而且也没有证据说刷新能加快恢复。
                 print(f"    [登录态] {result.get('error')}，{COOKIE_RETRY_S:.0f}s 后再看一次"
-                      f"（等浏览器把 cookie 交出来，最多等到 {deadline - time.monotonic():.0f}s 后）",
+                      f"（等浏览器把登录 cookie 交出来，最多等到 {deadline - time.monotonic():.0f}s 后）",
                       file=sys.stderr)
                 time.sleep(COOKIE_RETRY_S)
                 continue
