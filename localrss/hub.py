@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -44,18 +45,40 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_STATE = "state/hub.json"
 DEFAULT_LEASE = 7 * 24 * 3600  # 订阅租期，7 天
 FETCH_TIMEOUT = 20.0
+# 推送要把整个 feed 传上去，FreshRSS 收下后还要更新数据库，比抓一次 feed 慢得多。
+# 20 秒在链路抖一下、或几篇大 feed 同时到的时候很容易不够（见 2026-11-20 的
+# 连续三次 timed out），所以单独给推送更长的超时。
+PUSH_TIMEOUT = 45.0
+PUSH_ATTEMPTS = 3
+PUSH_RETRY_DELAY = 3.0
 VERIFY_TIMEOUT = 10.0
 UA = "local-rss-hub"
+
+# 本机 / 局域网 / tailnet 的地址不该绕代理。hub 常常从带 HTTP_PROXY 的 shell
+# 里被 pm2 拉起来，走代理去访问自己或 tailnet 上的 feed 会让一次网络抖动直接
+# 变成抓取失败；公网地址仍然用环境里的代理。
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
+def _is_local_url(url: str) -> bool:
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False  # 域名交给环境里的代理规则
+
+
 def _request(url: str, *, data: bytes | None = None, headers: dict | None = None,
              method: str | None = None, timeout: float = FETCH_TIMEOUT):
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    return urllib.request.urlopen(req, timeout=timeout)
+    opener = _DIRECT_OPENER.open if _is_local_url(url) else urllib.request.urlopen
+    return opener(req, timeout=timeout)
 
 
 def verify_callback(callback: str, mode: str, topic: str, verify_token: str) -> bool:
@@ -93,6 +116,9 @@ class Hub:
         self.state_path = state_path
         self.lease_seconds = lease_seconds
         self._lock = threading.Lock()
+        # 推送串行发：同一轮几个源一起更新时，同时砸给 FreshRSS 会把对面拖到
+        # 一起超时。排队一个个发，正常情况每次也就一两秒。
+        self._push_lock = threading.Lock()
         self._subs: dict[str, list[dict]] = {}  # topic -> [{callback, secret, lease_end}]
         self._digests: dict[str, str] = {}  # topic -> sha256(上次推的内容)
         self._load()
@@ -218,14 +244,38 @@ class Hub:
         if secret:
             mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha1).hexdigest()
             headers["X-Hub-Signature"] = f"sha1={mac}"
-        try:
-            with _request(sub["callback"], data=body, headers=headers, method="POST") as r:
-                _log(f"推送  {sub['callback']} -> HTTP {r.status}")
-                return True
-        except urllib.error.HTTPError as e:
-            _log(f"错误  推送 {sub['callback']} 失败：HTTP {e.code} {e.reason}")
-        except (urllib.error.URLError, OSError) as e:
-            _log(f"错误  推送 {sub['callback']} 失败：{e}")
+
+        for attempt in range(1, PUSH_ATTEMPTS + 1):
+            try:
+                with self._push_lock:
+                    with _request(
+                        sub["callback"],
+                        data=body,
+                        headers=headers,
+                        method="POST",
+                        timeout=PUSH_TIMEOUT,
+                    ) as r:
+                        _log(f"推送  {sub['callback']} -> HTTP {r.status}")
+                        return True
+            except urllib.error.HTTPError as e:
+                e.close()
+                # 4xx 是请求本身有问题，重试也不会变；5xx 才值得再试一次。
+                if e.code < 500 or attempt == PUSH_ATTEMPTS:
+                    _log(f"错误  推送 {sub['callback']} 失败：HTTP {e.code} {e.reason}")
+                    return False
+                _log(
+                    f"重试  推送 {sub['callback']}：HTTP {e.code} {e.reason}"
+                    f"（第 {attempt}/{PUSH_ATTEMPTS} 次）"
+                )
+            except (urllib.error.URLError, OSError) as e:
+                if attempt == PUSH_ATTEMPTS:
+                    _log(f"错误  推送 {sub['callback']} 失败：{e}")
+                    return False
+                _log(
+                    f"重试  推送 {sub['callback']}：{e}"
+                    f"（第 {attempt}/{PUSH_ATTEMPTS} 次）"
+                )
+            time.sleep(PUSH_RETRY_DELAY * attempt)
         return False
 
 
